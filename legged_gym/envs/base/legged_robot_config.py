@@ -33,7 +33,7 @@ from .base_config import BaseConfig
 class LeggedRobotCfg(BaseConfig):
     class env:
         num_envs = 4096
-        num_observations = 235
+        num_observations = 45 #235
         num_privileged_obs = None # if not None a priviledge_obs_buf will be returned by step() (critic obs for assymetric training). None is returned otherwise 
         num_actions = 12
         env_spacing = 3.  # not used with heightfields/trimeshes 
@@ -50,7 +50,7 @@ class LeggedRobotCfg(BaseConfig):
         dynamic_friction = 1.0
         restitution = 0.
         # rough terrain only:
-        measure_heights = True
+        measure_heights = False # True
         measured_points_x = [-0.8, -0.7, -0.6, -0.5, -0.4, -0.3, -0.2, -0.1, 0., 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8] # 1mx1.6m rectangle (without center line)
         measured_points_y = [-0.5, -0.4, -0.3, -0.2, -0.1, 0., 0.1, 0.2, 0.3, 0.4, 0.5]
         selected = False # select a unique terrain type and pass all arguments
@@ -130,8 +130,8 @@ class LeggedRobotCfg(BaseConfig):
     class rewards:
         class scales:
             termination = -0.0
-            tracking_lin_vel = 3.0
-            tracking_ang_vel = 1.5
+            tracking_lin_vel = 0.0 #3.5
+            tracking_ang_vel = 1.5 #1.5
             lin_vel_z = -0.0
             ang_vel_xy = -0.0
             orientation = -0.0
@@ -144,9 +144,9 @@ class LeggedRobotCfg(BaseConfig):
             feet_stumble = -0.0 
             action_rate = -0.01
             stand_still = -0.
-            handstand_feet_height_exp = 10.0
-            handstand_feet_on_air = 1.0
-            handstand_feet_air_time = 1.0
+            handstand_feet_height_exp = 25.0
+            handstand_feet_on_air = 2.0 #1.0
+            handstand_feet_air_time = 2.0 #1.0
             handstand_orientation_l2 = -1.0
             
         only_positive_rewards = False # if true negative total rewards are clipped at zero (avoids early termination problems)
@@ -159,8 +159,8 @@ class LeggedRobotCfg(BaseConfig):
 
     class params:  # 参数单独放在params类中
         handstand_feet_height_exp = {
-            "target_height": 0.6,
-            "std": 0.5
+            "target_height": 0.65,
+            "std": 0.3
         }
         handstand_orientation_l2 = {
             "target_gravity": [-1.0, 0.0, 0.0]
@@ -169,7 +169,7 @@ class LeggedRobotCfg(BaseConfig):
             "threshold": 5.0
         }
         feet_name_reward={
-            "feet_name" : "F.*_foot"
+            "feet_name" : "F.*_FOOT"
         }
         
     class normalization:
@@ -178,7 +178,7 @@ class LeggedRobotCfg(BaseConfig):
             ang_vel = 0.25
             dof_pos = 1.0
             dof_vel = 0.05
-            height_measurements = 5.0
+            height_measurements = 5
         clip_observations = 100.
         clip_actions = 100.
 
