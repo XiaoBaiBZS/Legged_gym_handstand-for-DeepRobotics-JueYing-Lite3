@@ -32,7 +32,7 @@ from legged_gym.envs.base.legged_robot_config import LeggedRobotCfg, LeggedRobot
 
 class Lite3RoughCfg( LeggedRobotCfg ):
     class init_state( LeggedRobotCfg.init_state ):
-        pos = [0.0, 0.0, 0.42]  # x,y,z [m]
+        pos = [0.0, 0.0, 0.35]  # x,y,z [m]
         default_joint_angles = { # = target angles [rad] when action = 0.0
             'FL_HipX_joint': 0.0,   # [rad]
             'HL_HipX_joint': 0.0,   # [rad]
@@ -64,7 +64,7 @@ class Lite3RoughCfg( LeggedRobotCfg ):
         file = '{LEGGED_GYM_ROOT_DIR}/resources/robots/lite3/urdf/lite3.urdf'
         name = "lite3"
         foot_name = "foot" 
-        penalize_contacts_on = ["HipY", "Knee","THIGH"]
+        penalize_contacts_on = ["SHANK", "THIGH","Knee"]
         terminate_after_contacts_on = ["TORSO"]
         self_collisions = 1 # 1 to disable, 0 to enable...bitwise filter
   

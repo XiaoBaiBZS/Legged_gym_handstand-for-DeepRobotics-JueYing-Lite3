@@ -99,9 +99,9 @@ class LeggedRobotCfg(BaseConfig):
     class asset:
         file = ""
         name = "legged_robot"  # actor name
-        foot_name = "None" # name of the feet bodies, used to index body state and contact force tensors
-        penalize_contacts_on = []
-        terminate_after_contacts_on = []
+        foot_name = "foot" # name of the feet bodies, used to index body state and contact force tensors
+        penalize_contacts_on = ["SHANK", "THIGH","Knee"]
+        terminate_after_contacts_on = ["TORSO"]
         disable_gravity = False
         collapse_fixed_joints = True # merge bodies connected by fixed joints. Specific fixed joints can be kept by adding " <... dont_collapse="true">
         fix_base_link = False # fixe the base of the robot
@@ -130,10 +130,10 @@ class LeggedRobotCfg(BaseConfig):
     class rewards:
         class scales:
             termination = -0.0
-            tracking_lin_vel = 0.0 #3.5
-            tracking_ang_vel = 1.5 #1.5
-            lin_vel_z = -0.0
-            ang_vel_xy = -0.0
+            tracking_lin_vel = 3.5 #3.5
+            tracking_ang_vel = 3. #1.5
+            lin_vel_z = -0.2
+            ang_vel_xy = -0.2
             orientation = -0.0
             torques = -0.00001
             dof_vel = -0.
@@ -143,11 +143,11 @@ class LeggedRobotCfg(BaseConfig):
             collision = -1.
             feet_stumble = -0.0 
             action_rate = -0.01
-            stand_still = -0.
-            handstand_feet_height_exp = 25.0
-            handstand_feet_on_air = 2.0 #1.0
-            handstand_feet_air_time = 2.0 #1.0
-            handstand_orientation_l2 = -1.0
+            stand_still = -0.5
+            handstand_feet_height_exp = 10.0 #10
+            handstand_feet_on_air = 1.0 #1.0
+            handstand_feet_air_time = 0.0 #1.0
+            handstand_orientation_l2 = -2.0
             
         only_positive_rewards = False # if true negative total rewards are clipped at zero (avoids early termination problems)
         tracking_sigma = 0.25 # tracking reward = exp(-error^2/sigma)
@@ -159,14 +159,14 @@ class LeggedRobotCfg(BaseConfig):
 
     class params:  # 参数单独放在params类中
         handstand_feet_height_exp = {
-            "target_height": 0.65,
-            "std": 0.3
+            "target_height": 0.9,
+            "std": 0.25
         }
         handstand_orientation_l2 = {
             "target_gravity": [-1.0, 0.0, 0.0]
         }
         handstand_feet_air_time = {
-            "threshold": 5.0
+            "threshold": 4.0
         }
         feet_name_reward={
             "feet_name" : "F.*_FOOT"
@@ -250,7 +250,7 @@ class LeggedRobotCfgPPO(BaseConfig):
         policy_class_name = 'ActorCritic'
         algorithm_class_name = 'PPO'
         num_steps_per_env = 24 # per iteration
-        max_iterations = 1500 # number of policy updates
+        max_iterations = 500 # number of policy updates
 
         # logging
         save_interval = 50 # check for potential saves every this many iterations
