@@ -940,51 +940,122 @@ class LeggedRobot(BaseTask):
 
 
 
+    # def _reward_handstand_feet_on_air(self):
+    #     """
+    #     脚部在空奖励：
+    #     1. 使用 self.contact_forces 判断足部是否接触地面（通过预先设置的阈值）。
+    #     2. 如果所有足部都没有接触地面，则奖励1，否则奖励为0（或取平均）。
+    #     """
+    #     feet_indices = [i for i, name in enumerate(self.rigid_body_names) if re.match(self.cfg.params.feet_name_reward["feet_name"], name)]
+    #     # print(feet_indices)
+    #     feet_indices_tensor = torch.tensor(feet_indices, dtype=torch.long, device=self.rigid_body_pos.device)
+    #     # contact_forces: shape = (num_envs, num_bodies, 3)
+    #     contact = torch.norm(self.contact_forces[:, feet_indices_tensor, :], dim=-1) > 1.0
+    #     # 如果所有足部均未接触地面，reward = 1；也可以使用 mean 得到部分奖励
+    #     reward = (~contact).float().prod(dim=1)
+    #     # print(reward)
+    #     return reward
+    #     # return 0
+
+
     def _reward_handstand_feet_on_air(self):
         """
-        脚部在空奖励：
-        1. 使用 self.contact_forces 判断足部是否接触地面（通过预先设置的阈值）。
-        2. 如果所有足部都没有接触地面，则奖励1，否则奖励为0（或取平均）。
+        改进版：同时检查脚部和膝盖的接触状态
         """
-        feet_indices = [i for i, name in enumerate(self.rigid_body_names) if re.match(self.cfg.params.feet_name_reward["feet_name"], name)]
-        # print(feet_indices)
+        # 1. 获取脚部索引（原有逻辑）
+        feet_indices = [i for i, name in enumerate(self.rigid_body_names) 
+                    if re.match(self.cfg.params.feet_name_reward["feet_name"], name)]
         feet_indices_tensor = torch.tensor(feet_indices, dtype=torch.long, device=self.rigid_body_pos.device)
-        # contact_forces: shape = (num_envs, num_bodies, 3)
-        contact = torch.norm(self.contact_forces[:, feet_indices_tensor, :], dim=-1) > 1.0
-        # 如果所有足部均未接触地面，reward = 1；也可以使用 mean 得到部分奖励
-        reward = (~contact).float().prod(dim=1)
-        # print(reward)
+        
+        # 2. 获取膝盖/腿部其他可能接触地面的部位索引
+        knee_indices = [i for i, name in enumerate(self.rigid_body_names) 
+                    if re.match(r'.*(Knee|THIGH|SHANK).*', name.lower())]  # 匹配膝盖、大腿、小腿等
+        knee_indices_tensor = torch.tensor(knee_indices, dtype=torch.long, device=self.rigid_body_pos.device)
+        
+        # 3. 检查脚部接触
+        feet_contact = torch.norm(self.contact_forces[:, feet_indices_tensor, :], dim=-1) > 1.0
+        
+        # 4. 检查膝盖接触
+        knee_contact = torch.norm(self.contact_forces[:, knee_indices_tensor, :], dim=-1) > 1.0
+        
+        # 5. 奖励条件：所有脚部未接触 AND 所有膝盖未接触
+        reward = ((~feet_contact).float().prod(dim=1) * 
+                (~knee_contact).float().prod(dim=1))
+        
         return reward
-        # return 0
-
-
+    
     def _reward_handstand_feet_air_time(self):
         """
-        计算手倒立时足部空中时间奖励
+        改进版：计算手倒立时足部空中时间奖励，同时惩罚膝盖接触
         """
         threshold = self.cfg.params.handstand_feet_air_time["threshold"]
 
-        # 获取 "R.*_foot" 索引
+        # 获取脚部索引
         feet_indices = [i for i, name in enumerate(self.rigid_body_names) if re.match(self.cfg.params.feet_name_reward["feet_name"], name)]
         feet_indices_tensor = torch.tensor(feet_indices, dtype=torch.long, device=self.device)
+        
+        # 获取膝盖索引
+        knee_indices = [i for i, name in enumerate(self.rigid_body_names) 
+                    if re.match(r'.*(Knee|THIGH|SHANK).*', name.lower())]
+        knee_indices_tensor = torch.tensor(knee_indices, dtype=torch.long, device=self.device)
 
-        # 计算当前接触状态
-        contact = self.contact_forces[:, feet_indices_tensor, 2] > 1.0  # (batch_size, num_feet)
-        if not hasattr(self,"last_contacts") or self.last_contacts.shape != contact.shape:
-            self.last_contacts = torch.zeros_like(contact,dtype=torch.bool,device=contact.device)
+        # 计算脚部接触状态
+        feet_contact = self.contact_forces[:, feet_indices_tensor, 2] > 1.0  # (batch_size, num_feet)
+        
+        # 计算膝盖接触状态
+        knee_contact = self.contact_forces[:, knee_indices_tensor, 2] > 1.0  # (batch_size, num_knees)
+        any_knee_contact = knee_contact.any(dim=1)  # 任意膝盖接触就惩罚
+
+        # 初始化状态变量（保持原有逻辑）
+        if not hasattr(self,"last_contacts") or self.last_contacts.shape != feet_contact.shape:
+            self.last_contacts = torch.zeros_like(feet_contact, dtype=torch.bool, device=feet_contact.device)
             
-        if not hasattr(self,"feet_air_time") or self.feet_air_time.shape != contact.shape:
-            self.feet_air_time = torch.zeros_like(contact,dtype=torch.float,device=contact.device)
-        contact_filt = torch.logical_or(contact,self.last_contacts)
-        self.last_contacts=contact
+        if not hasattr(self,"feet_air_time") or self.feet_air_time.shape != feet_contact.shape:
+            self.feet_air_time = torch.zeros_like(feet_contact, dtype=torch.float, device=feet_contact.device)
+        
+        # 原有悬空时间计算逻辑
+        contact_filt = torch.logical_or(feet_contact, self.last_contacts)
+        self.last_contacts = feet_contact
         first_contact = (self.feet_air_time > 0.0) * contact_filt
-        self.feet_air_time+=self.dt
-        rew_airTime = torch.sum((self.feet_air_time - threshold) * first_contact,dim=1)
-        # rew_airTime*=torch.norm(self.commands[:,:2],dim =1)>0.1
+        self.feet_air_time += self.dt
+        
+        # 计算基础悬空时间奖励
+        rew_airTime = torch.sum((self.feet_air_time - threshold) * first_contact, dim=1)
+        
+        # 添加膝盖接触惩罚：有膝盖接触时奖励为0
+        rew_airTime = rew_airTime * (~any_knee_contact).float()
+        
         self.feet_air_time *= ~contact_filt
         
-        #print(rew_airTime)
         return rew_airTime
+
+    # def _reward_handstand_feet_air_time(self):
+    #     """
+    #     计算手倒立时足部空中时间奖励
+    #     """
+    #     threshold = self.cfg.params.handstand_feet_air_time["threshold"]
+
+    #     # 获取 "R.*_foot" 索引
+    #     feet_indices = [i for i, name in enumerate(self.rigid_body_names) if re.match(self.cfg.params.feet_name_reward["feet_name"], name)]
+    #     feet_indices_tensor = torch.tensor(feet_indices, dtype=torch.long, device=self.device)
+
+    #     # 计算当前接触状态
+    #     contact = self.contact_forces[:, feet_indices_tensor, 2] > 1.0  # (batch_size, num_feet)
+    #     if not hasattr(self,"last_contacts") or self.last_contacts.shape != contact.shape:
+    #         self.last_contacts = torch.zeros_like(contact,dtype=torch.bool,device=contact.device)
+            
+    #     if not hasattr(self,"feet_air_time") or self.feet_air_time.shape != contact.shape:
+    #         self.feet_air_time = torch.zeros_like(contact,dtype=torch.float,device=contact.device)
+    #     contact_filt = torch.logical_or(contact,self.last_contacts)
+    #     self.last_contacts=contact
+    #     first_contact = (self.feet_air_time > 0.0) * contact_filt
+    #     self.feet_air_time+=self.dt
+    #     rew_airTime = torch.sum((self.feet_air_time - threshold) * first_contact,dim=1)
+    #     # rew_airTime*=torch.norm(self.commands[:,:2],dim =1)>0.1
+    #     self.feet_air_time *= ~contact_filt
+        
+    #     #print(rew_airTime)
+    #     return rew_airTime
         
 
 
