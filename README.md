@@ -12,6 +12,7 @@ Legged_gym_handstand_for_DeepRobotics_Lite3 是希望通过强化学习的方式
 [6]https://github.com/fan-ziqi/rl_sar
 [7]https://github.com/fan-ziqi/robot_lab
 [8]https://github.com/DeepRoboticsLab/Lite3_rl_deploy
+[9]https://support.limxdynamics.com/docs/tron-1-sdk/rl-model-training
 ## 初步 ##
 ### 1. 使用 python 3.6、3.7 或 3.8 创建新的 python 虚拟环境（推荐 3.8） ###
 ```bash
@@ -429,13 +430,29 @@ conda activate env_isaacgym
 	```
 
 若运行中出现了找不到 lite3 任务的情况，不妨把前文提到的关于 lite3 的修改同步复制到 legged_gym/resources 和legged_gym/legged_gym/env 里面。笔者遇到了类似的问题，如此修改便解决，但是不清楚是否由于此引起。
+
+如果训练不小心中断，不要担心，你可以根据检查点恢复训练，首先先让我们打开 logs 目录，这个目录下面存放着训练时候产生的检查点 pt 文件，让我们找到训练的实验名称文件夹(比如：rough_lite3)，然后找到你上次训练的日期的文件夹，这里面存放着检查点，如果你没有对仓库进行修改，这里应该是每50次训练存储一次。我们可以使用如下指令恢复训练，但是需要注意的是恢复训练指的是“在指定检查点的基础上重新运行多少轮”，所以如果你不改变训练轮数，他依然会接续训练相同次数。
+```bash
+python train.py --task=lite3 --resume  --load_run Oct31_22-14-50_ --checkpoint 18600 --headless
+```
+其中 --load_run 后面需要加上 logs 下面你之前训练存储的文件目录名称； --checkpoint 指的是从哪个检查点接续训练。
 ### play ###
 ```bash
 cd legged_gym_handstand/legged_gym/script
 python play.py --task=lite3
 ```
 首先先 cd 进入代码文件夹，然后运行 play.py 即可，传入参数 task=lite3 ，运行完成后即可看到训练的效果，然后就可以在对应目录下找到生成的 .onnx 文件。
-## sim2sim test
+
+可以通过 tensorboard 来帮助你进行训练状况的查看。如果 tensorboard 的使用中出现了安装问题，不妨让 ai 帮帮你。
+```bash
+cd ~/legged_gym_handstand/
+tensorboard --logdir=logs/rough_lite3
+
+# 然后浏览器访问 http://localhost:6006/ 查看
+```
+
+![[Pasted image 20251101074410.png]]
+### sim2sim test ###
 如果在上一步骤中获得到的效果比较理想，可以进行 sim2sim test ，将直接训练好的模型部署到实机上往往容易失败，而且比较危险，很有可能弄坏设备，因此我们先进行 sim2sim test ，mujoco 是一个与真实环境比较类似的仿真环境，我们需要使用由云深处提供的 repo ，进行 sim2sim test ，这一步的操作推荐在非 conda 环境内进行，前文已经提及，笔者在 conda 环境中执行 sim2sim test 会报错。我们将得到的 .onnx 文件复制到 Lite3_rl_deploy/policy/ppo 文件夹中，然后修改 .onnx 文件的名称为 policy.onnx ，然后我们打开两个终端，一个终端启动仿真 mujoco ，另一个启用键盘控制。
 ```bash
 cd Lite3_rl_deploy
@@ -491,6 +508,6 @@ cmake .. -DBUILD_PLATFORM=arm -DBUILD_SIM=OFF -DSEND_REMOTE=OFF
 make -j 
 ./rl_deploy
 ```
-执行完上述指令后四足机器人应当关节回零然后我们拿出手柄，连接机器狗的 wifi ，然后掌机上需要提前安装好云深处为强化学习测试开发的遥控 App “云深处科技”，应用图标是蓝色的 Flutter 图标。![[Pasted image 20251031115100.png]]然后我们进入 App ，点击左上角更多按钮，然后修改端口号为：192.168.1.120:12121 ，然后点击右上角保存退出重新进入应用。![[image/Pasted image 20251031115136.png]]
-然后我们回到电脑，通过 ssh 连接四足机器人，cd 进入并使用 vim 打开 jy_exe/conf/network.toml 文件，修改数据上报的 ip ，我们希望其返回关节信息、传感器信息到我们的电脑，修改此处的 ip 为 192.168.2.1 。然后我们试着使用手柄让四足机器人起立，我们可以按下手柄右侧字母 A 键，可以看到四足机器人起立，为平地站立静止状态。然后我们可以在确保安全的条件下按下手柄右侧字母 Y 键，此时机器人将会进入到 rl 力控状态。若不希望继续进行，可以 ctrl+c 终止 ./rl_deploy 进行。
+执行完上述指令后四足机器人应当关节回零然后我们拿出手柄，连接机器狗的 wifi ，然后掌机上需要提前安装好云深处为强化学习测试开发的遥控 App “云深处科技”，应用图标是蓝色的 Flutter 图标。![[Pasted image 20251031115100.png]]然后我们进入 App ，点击左上角更多按钮，然后修改端口号为：192.168.1.120:12121 ，然后点击右上角保存退出重新进入应用。![[Pasted image 20251031115136.png]]
+然后我们回到电脑，通过 ssh 连接四足机器人，cd 进入并使用 vim 打开 jy_exe/conf/network.toml 文件，修改数据上报的 ip ，我们希望其返回关节信息、传感器信息到我们的电脑，修改此处的 ip 为 192.168.2.1 。然后我们试着使用手柄让四足机器人起立，我们可以按下手柄右侧字母 Y 键，可以看到四足机器人起立，为平地站立静止状态。然后我们可以在确保安全的条件下按下手柄右侧字母 A 键，此时机器人将会进入到 rl 力控状态。若不希望继续进行，可以 ctrl+c 终止 ./rl_deploy 进行。
 
