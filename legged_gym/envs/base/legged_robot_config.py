@@ -131,7 +131,7 @@ class LeggedRobotCfg(BaseConfig):
         class scales:
             termination = -0.0
             tracking_lin_vel = 3. #3.0
-            tracking_ang_vel = 2. #1.5
+            tracking_ang_vel = 0.2 #1.5
             lin_vel_z = -0.
             ang_vel_xy = -0.2
             orientation = -0.0
@@ -143,11 +143,11 @@ class LeggedRobotCfg(BaseConfig):
             collision = -1.
             feet_stumble = -0.0 
             action_rate = -0.02
-            stand_still = -0.3
+            stand_still = -0.35
             handstand_feet_height_exp = 10.0 #10
-            handstand_feet_on_air = 1. #1.0
-            handstand_feet_air_time = 1. #1.0
-            handstand_orientation_l2 = -1.5
+            handstand_feet_on_air = 2 #1.0
+            handstand_feet_air_time = 2 #1.0
+            handstand_orientation_l2 = -0.5
             
         only_positive_rewards = False # if true negative total rewards are clipped at zero (avoids early termination problems)
         tracking_sigma = 0.25 # tracking reward = exp(-error^2/sigma)
@@ -159,11 +159,11 @@ class LeggedRobotCfg(BaseConfig):
 
     class params:  # 参数单独放在params类中
         handstand_feet_height_exp = {
-            "target_height": 1.0,
+            "target_height": 0.75,
             "std": 0.5
         }
         handstand_orientation_l2 = {
-            "target_gravity": [-1.0, 0.0, 0.0]
+            "target_gravity": [-1, 0.0, 0.0]
         }
         handstand_feet_air_time = {
             "threshold": 5.0
@@ -187,10 +187,10 @@ class LeggedRobotCfg(BaseConfig):
         noise_level = 1.0 # scales other values
         class noise_scales:
             dof_pos = 0.01
-            dof_vel = 1.5
-            lin_vel = 0.1
-            ang_vel = 0.2
-            gravity = 0.1 #0.05
+            dof_vel = 2 # 1.5
+            lin_vel = 0.2 # 0.1
+            ang_vel = 0.4 #0.2
+            gravity = 0.05 #0.05
             height_measurements = 0.1
 
     # viewer camera:
@@ -250,7 +250,7 @@ class LeggedRobotCfgPPO(BaseConfig):
         policy_class_name = 'ActorCritic'
         algorithm_class_name = 'PPO'
         num_steps_per_env = 24 # per iteration
-        max_iterations = 1500 # number of policy updates
+        max_iterations = 500 # number of policy updates
 
         # logging
         save_interval = 50 # check for potential saves every this many iterations

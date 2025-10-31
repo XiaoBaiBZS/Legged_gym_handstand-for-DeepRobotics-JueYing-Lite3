@@ -34,20 +34,20 @@ class Lite3RoughCfg( LeggedRobotCfg ):
     class init_state( LeggedRobotCfg.init_state ):
         pos = [0.0, 0.0, 0.35]  # x,y,z [m]
         default_joint_angles = { # = target angles [rad] when action = 0.0
-            'FL_HipX_joint': 0.0,   # [rad]
-            'HL_HipX_joint': 0.0,   # [rad]
-            'FR_HipX_joint': -0.0,  # [rad]
-            'HR_HipX_joint': -0.0,   # [rad]
+            'FL_HipX_joint': 0.02,   # [rad]
+            'HL_HipX_joint': 0.02,   # [rad]
+            'FR_HipX_joint': -0.02,  # [rad]
+            'HR_HipX_joint': -0.02,   # [rad]
 
-            'FL_HipY_joint': -0.8,     # [rad]
-            'HL_HipY_joint': -1.,   # [rad]
-            'FR_HipY_joint': -0.8,     # [rad]
-            'HR_HipY_joint': -1.,   # [rad]
+            'FL_HipY_joint': -0.77,     # [rad]
+            'HL_HipY_joint': -0.77,   # [rad]
+            'FR_HipY_joint': -0.77,     # [rad]
+            'HR_HipY_joint': -0.77,   # [rad]
 
-            'FL_Knee_joint': 1.6,   # [rad]
-            'HL_Knee_joint': 1.6,    # [rad]
-            'FR_Knee_joint': 1.6,  # [rad]
-            'HR_Knee_joint': 1.6,    # [rad]
+            'FL_Knee_joint': 1.54,   # [rad]
+            'HL_Knee_joint': 1.54,    # [rad]
+            'FR_Knee_joint': 1.54,  # [rad]
+            'HR_Knee_joint': 1.54,    # [rad]
         }
 
     class control( LeggedRobotCfg.control ):
