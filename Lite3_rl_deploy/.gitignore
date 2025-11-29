@@ -1,0 +1,8 @@
+build
+*.zip
+.vscode
+
+
+third_party/libtorch
+third_party/x30_motion_sdk
+**/tmp/*
