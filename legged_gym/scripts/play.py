@@ -77,11 +77,29 @@ def play(args):
     camera_direction = np.array(env_cfg.viewer.lookat) - np.array(env_cfg.viewer.pos)
     img_idx = 0
     
-    env.commands[:,0]=.0 # 改了一下 注释 --> 取消注释
-    env.commands[:,1]=.0 # 改了一下 注释 --> 取消注释
-    env.commands[:,2]=.0 # 改了一下 注释 --> 取消注释
+    # 初始化命令
+    env.commands[:,0] = 0.0
+    env.commands[:,1] = 0.0
+    env.commands[:,2] = 0.0
+    env.commands[:,3] = 1.0  # 初始为手倒立
+    
+    # 计算切换周期
+    steps_per_5_sec = int(5.0 / env.dt)
+    cycle_length = 2 * steps_per_5_sec
     
     for i in range(10*int(env.max_episode_length)):
+        # 动态设置命令维度3：0-5秒为1（手倒立），5-10秒为0（站立），循环
+        phase = i % cycle_length
+        if phase < steps_per_5_sec:
+            env.commands[:, 3] = 1.0  # 手倒立
+        else:
+            env.commands[:, 3] = 0.0  # 站立
+        
+        # 其他命令保持为0
+        env.commands[:, 0] = 0.0
+        env.commands[:, 1] = 0.0
+        env.commands[:, 2] = 0.0
+
         actions = policy(obs.detach())
         obs, _, rews, dones, infos = env.step(actions.detach())
         if RECORD_FRAMES:
@@ -103,6 +121,7 @@ def play(args):
                     'command_x': env.commands[robot_index, 0].item(),
                     'command_y': env.commands[robot_index, 1].item(),
                     'command_yaw': env.commands[robot_index, 2].item(),
+                    'command_stand_handstand': env.commands[robot_index, 3].item(),  # 新增记录
                     'base_vel_x': env.base_lin_vel[robot_index, 0].item(),
                     'base_vel_y': env.base_lin_vel[robot_index, 1].item(),
                     'base_vel_z': env.base_lin_vel[robot_index, 2].item(),

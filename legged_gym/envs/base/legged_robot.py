@@ -38,6 +38,7 @@ from isaacgym.torch_utils import *
 from isaacgym import gymtorch, gymapi, gymutil
 
 import torch
+import math
 from torch import Tensor
 from typing import Tuple, Dict
 
@@ -62,13 +63,19 @@ class LeggedRobot(BaseTask):
             device_id (int): 0, 1, ...
             headless (bool): Run without rendering if True
         """
+        # 扩展命令维度，新增一个维度用于控制站立/手倒立转换
+        cfg.commands.num_commands = 4  # 从4增加到5 (lin_vel_x, lin_vel_y, ang_vel_yaw, heading, stand_handstand)
+        cfg.env.num_observations = 46  # 从45增加到46以适应新的命令维度
         self.cfg = cfg
         self.sim_params = sim_params
         self.height_samples = None
         self.debug_viz = False
         self.init_done = False
-        self._parse_cfg(self.cfg)
         super().__init__(self.cfg, sim_params, physics_engine, sim_device, headless)
+         # ✅ 新增：Env0 的 episode 计数器
+        self.env_episode_count = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self._parse_cfg(self.cfg)
+        
 
         if not self.headless:
             self.set_camera(self.cfg.viewer.pos, self.cfg.viewer.lookat)
@@ -98,6 +105,7 @@ class LeggedRobot(BaseTask):
         # return clipped obs, clipped states (None), rewards, dones and infos
         clip_obs = self.cfg.normalization.clip_observations
         self.obs_buf = torch.clip(self.obs_buf, -clip_obs, clip_obs)
+        self._debug_print_env0()
         if self.privileged_obs_buf is not None:
             self.privileged_obs_buf = torch.clip(self.privileged_obs_buf, -clip_obs, clip_obs)
         return self.obs_buf, self.privileged_obs_buf, self.rew_buf, self.reset_buf, self.extras
@@ -181,7 +189,16 @@ class LeggedRobot(BaseTask):
         self._reset_dofs(env_ids)
         self._reset_root_states(env_ids)
 
-        self._resample_commands(env_ids)
+        # self._resample_commands(env_ids)
+        # ✅ 新增：按 episode 编号交替模式
+        self.env_episode_count[env_ids] += 1  # 每 reset 一次，episode 数 +1
+        is_handstand = (self.env_episode_count[env_ids] % 2 == 1)  # 第1,3,5...轮是 handstand
+
+        # 假设 commands[:, 3] 是手倒立开关（1=handstand, 0=standing）
+        self.commands[env_ids, 3] = is_handstand.float()
+
+        # 如果你还有其他命令维度（如前进速度），可以同时清零或设默认值
+        self.commands[env_ids, :3] = 0.0  # 例如：lin_vel_x, lin_vel_y, ang_vel_yaw 全为0
 
         # reset buffers
         self.last_actions[env_ids] = 0.
@@ -209,6 +226,9 @@ class LeggedRobot(BaseTask):
             self.transition_progress[env_ids] = 0.0
             self.transition_times[env_ids] = torch_rand_float(3.0, 5.0, (len(env_ids), 1), device=self.device).squeeze(1)
             self.target_gravity_vec[env_ids] = torch.tensor([0., 0., -1.], device=self.device)
+            # 重置站立/手倒立状态
+            self.stand_handstand_state[env_ids] = 0  # 默认为站立状态
+            self.transition_in_progress[env_ids] = False
     
     def _update_progressive_targets(self):
         """更新渐进控制目标姿态"""
@@ -225,9 +245,9 @@ class LeggedRobot(BaseTask):
         self.transition_progress = torch.clamp(actual_progress, 0.0, 1.0)
         
         # 定义姿态序列：水平 → 45度倾斜 → 竖直
-        stand_gravity = torch.tensor([0., 0., 1.], device=self.device)
+        stand_gravity = torch.tensor([0., 0., -1.], device=self.device)
         intermediate_gravity = torch.tensor([0.7, 0., 0.7], device=self.device)  # 45度倾斜
-        handstand_gravity = torch.tensor([1., 0., 0.], device=self.device)
+        handstand_gravity = torch.tensor([-1., 0., 0.], device=self.device)
         
         # 使用向量化操作替代if语句
         # 创建掩码：哪些环境处于第一阶段（进度<=0.5）
@@ -245,28 +265,139 @@ class LeggedRobot(BaseTask):
         if len(stage2_progress) > 0:
             stage2_target = intermediate_gravity + stage2_progress.unsqueeze(1) * (handstand_gravity - intermediate_gravity)
             self.target_gravity_vec[stage2_mask] = stage2_target
-            
-        
+   
     def compute_reward(self):
-        """ Compute rewards
-            Calls each reward function which had a non-zero scale (processed in self._prepare_reward_function())
-            adds each terms to the episode sums and to the total reward
-        """
-         # 在计算奖励前更新渐进控制目标
-        self._update_progressive_targets()
         self.rew_buf[:] = 0.
-        for i in range(len(self.reward_functions)):
-            name = self.reward_names[i]
-            rew = self.reward_functions[i]() * self.reward_scales[name]
-            self.rew_buf += rew
-            self.episode_sums[name] += rew
-        if self.cfg.rewards.only_positive_rewards:
-            self.rew_buf[:] = torch.clip(self.rew_buf[:], min=0.)
-        # add termination reward after clipping
-        if "termination" in self.reward_scales:
-            rew = self._reward_termination() * self.reward_scales["termination"]
-            self.rew_buf += rew
-            self.episode_sums["termination"] += rew
+
+        is_handstand = (self.commands[:, 3] > 0.5)
+
+        # 计算各项 reward（保留原始值用于 logging）
+        standing_rew = self._reward_standing()
+        handstand_rew = self._reward_handstand()
+        low_torques_rew = self._reward_low_torques()
+        handstand_feet_air_time_rew = self._reward_handstand_feet_air_time()
+        dof_acc_rew = self._reward_dof_acc()
+        dof_vel_rew = self._reward_dof_vel()
+        dof_pos_limits_rew = self._reward_dof_pos_limits()
+        torques_rew = self._reward_torques()
+        torque_smoothness_rew = self._reward_torque_smoothness()
+        action_rate_rew = self._reward_action_rate()
+        collision_rew = self._reward_collision()
+        termination_rew = self._reward_termination() if "termination" in self.reward_scales else 0
+
+        # 构建 reward 字典（用于 logging）
+        reward_components = {
+            "standing": standing_rew * (~is_handstand),
+            "handstand": handstand_rew * is_handstand,
+            "handstand_feet_air_time": handstand_feet_air_time_rew * is_handstand,
+            "torques": torques_rew,
+            # "torque_smoothness": torque_smoothness_rew,
+            "action_rate": action_rate_rew,
+            "dof_acc": dof_acc_rew,
+            "dof_vel" : dof_vel_rew,
+            "dof_pos_limits":dof_pos_limits_rew,
+            "low_torques": low_torques_rew,
+            "collision": collision_rew,
+            "termination": termination_rew,
+        }
+
+        # 累加到总 reward
+        for name, rew in reward_components.items():
+            scale = self.reward_scales.get(name, 0.0)
+            self.rew_buf += rew * scale
+
+        # ✅ 关键：全部加入 episode_sums（用于日志）
+        for name, rew in reward_components.items():
+            if name in self.episode_sums:
+                self.episode_sums[name] += rew  # 注意：这里加的是 unscaled 原始 reward！
+
+        # ==================== 🐾 调试打印：关键状态观测 ====================
+        if self.common_step_counter % 20 == 0:  # 每100步打印一次 env0 的状态
+            env_id = 0  # 观察第0个环境
+            
+            # 获取刚体位置 [num_envs, num_bodies, 3]
+            rb_pos = self.rigid_body_pos[env_id]  # shape: [num_bodies, 3]
+
+            # === 根据你的索引定义 ===
+            front_feet_idx = [4, 8]      # FL_FOOT, FR_FOOT
+            hind_feet_idx = [12, 16]     # HL_FOOT, HR_FOOT
+            hind_knee_idx = [11, 15]     # 假设是后膝盖/小腿
+
+            # 提取 z 高度
+            front_z = rb_pos[front_feet_idx, 2].cpu().numpy()
+            hind_z = rb_pos[hind_feet_idx, 2].cpu().numpy()
+            knee_z = rb_pos[hind_knee_idx, 2].cpu().numpy()
+            
+            base_height = self.root_states[env_id, 2].item()  # base z
+            proj_grav = self.projected_gravity[env_id].cpu().numpy()
+
+            mode = "handstand" if is_handstand[env_id] else "standing"
+
+            front_rel_x = rb_pos[front_feet_idx, 0] - self.root_states[0, 0].item()
+            mode = "handstand" if self.commands[0, 3] > 0.5 else "standing"
+            
+
+            print(f"\n{'='*60}")
+            print(f"📊 Env0 Debug | Step {self.common_step_counter} | Mode: {mode}")
+            print(f"📊 Env0 Episode #: {self.env_episode_count[0].item()} | Mode: {mode}")
+            print(f"   Base height: {base_height:.3f} m")
+            print(f"   Projected gravity: [{proj_grav[0]: .2f}, {proj_grav[1]: .2f}, {proj_grav[2]: .2f}]")
+            print(f"   Front feet z: [{front_z[0]:.3f}, {front_z[1]:.3f}] m")
+            print(f"   Front feet rel x: [{front_rel_x[0]:.3f}, {front_rel_x[1]:.3f}] m")
+            print(f"   Hind feet z:  [{hind_z[0]:.3f}, {hind_z[1]:.3f}] m")
+            print(f"   Hind knee z:  [{knee_z[0]:.3f}, {knee_z[1]:.3f}] m")
+            print(f"   Reward buf[0]: {self.rew_buf[env_id].item():.4f}")
+            print(f"   Standing rew: {standing_rew[env_id].item():.4f}")
+            print(f"   Handstand rew: {handstand_rew[env_id].item():.4f}")
+            print(f"{'='*60}\n")
+        # ==============================================================
+
+    # def compute_reward(self):
+    #     """ Compute rewards
+    #         Calls each reward function which had a non-zero scale (processed in self._prepare_reward_function())
+    #         adds each terms to the episode sums and to the total reward
+    #     """
+    #      # 在计算奖励前更新渐进控制目标
+    #     self._update_progressive_targets()
+        
+    #     # 根据命令更新站立/手倒立状态
+    #     self._update_stand_handstand_state()
+        
+    #     self.rew_buf[:] = 0.
+    #     for i in range(len(self.reward_functions)):
+    #         name = self.reward_names[i]
+    #         rew = self.reward_functions[i]() * self.reward_scales[name]
+    #         self.rew_buf += rew
+    #         self.episode_sums[name] += rew
+    #     if self.cfg.rewards.only_positive_rewards:
+    #         self.rew_buf[:] = torch.clip(self.rew_buf[:], min=0.)
+    #     # add termination reward after clipping
+    #     if "termination" in self.reward_scales:
+    #         rew = self._reward_termination() * self.reward_scales["termination"]
+    #         self.rew_buf += rew
+    #         self.episode_sums["termination"] += rew
+    
+    def _update_stand_handstand_state(self):
+        """根据命令更新站立/手倒立状态"""
+        # 检查命令维度是否包含新的状态转换命令
+        if self.commands.shape[1] >= 4:
+            # 获取命令中的站立/手倒立转换标志 (第4维，索引为4)
+            command_state = self.commands[:, 3]
+            
+            # 将命令值转换为整数状态 (0或1)
+            command_state_int = torch.round(command_state).long()
+            
+            # 更新状态：0为站立，1为手倒立
+            self.stand_handstand_state = command_state_int
+            
+            # 检查是否需要开始转换
+            should_start_transition = (command_state_int != self.current_stand_handstand_state)
+            
+            # 标记正在进行转换的环境
+            self.transition_in_progress = should_start_transition
+            
+            # 更新当前状态
+            self.current_stand_handstand_state = command_state_int.clone()
     
     def compute_observations(self):
         """ Computes observations
@@ -279,7 +410,7 @@ class LeggedRobot(BaseTask):
                                     self.base_ang_vel  * self.obs_scales.ang_vel,
                                     self.projected_gravity,
                                     # target_gravity_obs,  # 用目标姿态替换原来的commands部分
-                                    self.commands[:, :3] * self.commands_scale,
+                                    self.commands[:, :4] * self.commands_scale,  # 包含新的命令维度
                                     (self.dof_pos - self.default_dof_pos) * self.obs_scales.dof_pos,
                                     self.dof_vel * self.obs_scales.dof_vel,
                                     self.actions
@@ -411,20 +542,23 @@ class LeggedRobot(BaseTask):
             self._push_robots()
 
     def _resample_commands(self, env_ids):
-        """ Randommly select commands of some environments
+        """ 所有环境严格交替 standing / handstand """
+        if len(env_ids) == 0:
+            return
 
-        Args:
-            env_ids (List[int]): Environments ids for which new commands are needed
-        """
-        self.commands[env_ids, 0] = torch_rand_float(self.command_ranges["lin_vel_x"][0], self.command_ranges["lin_vel_x"][1], (len(env_ids), 1), device=self.device).squeeze(1)
-        self.commands[env_ids, 1] = torch_rand_float(self.command_ranges["lin_vel_y"][0], self.command_ranges["lin_vel_y"][1], (len(env_ids), 1), device=self.device).squeeze(1)
-        if self.cfg.commands.heading_command:
-            self.commands[env_ids, 3] = torch_rand_float(self.command_ranges["heading"][0], self.command_ranges["heading"][1], (len(env_ids), 1), device=self.device).squeeze(1)
-        else:
-            self.commands[env_ids, 2] = torch_rand_float(self.command_ranges["ang_vel_yaw"][0], self.command_ranges["ang_vel_yaw"][1], (len(env_ids), 1), device=self.device).squeeze(1)
+        # 1. 更新这些 env 的 episode 计数（每个 reset 一次，+1）
+        self.env_episode_count[env_ids] += 1
 
-        # set small commands to zero
-        self.commands[env_ids, :2] *= (torch.norm(self.commands[env_ids, :2], dim=1) > 0.2).unsqueeze(1)
+        # 2. 奇数 episode → handstand (1), 偶数 → standing (0)
+        is_handstand = (self.env_episode_count[env_ids] % 2 == 1)
+
+        # 3. 设置命令
+        self.commands[env_ids, 3] = is_handstand.float()  # 第4维：stand/handstand
+
+        # 4. 其他命令（速度等）设为0，因为两种模式都不需要移动
+        self.commands[env_ids, :3] = 0.0
+
+        # （可选）如果你以后想加 curriculum，可以在这里动态调整
 
     def _compute_torques(self, actions):
         """ Compute torques from actions.
@@ -516,17 +650,41 @@ class LeggedRobot(BaseTask):
                                                    torch.clip(self.terrain_levels[env_ids], 0)) # (the minumum level is zero)
         self.env_origins[env_ids] = self.terrain_origins[self.terrain_levels[env_ids], self.terrain_types[env_ids]]
     
+    # def update_command_curriculum(self, env_ids):
+    #     """ Implements a curriculum of increasing commands
+
+    #     Args:
+    #         env_ids (List[int]): ids of environments being reset
+    #     """
+    #     # If the tracking reward is above 80% of the maximum, increase the range of commands
+    #     if torch.mean(self.episode_sums["tracking_lin_vel"][env_ids]) / self.max_episode_length > 0.8 * self.reward_scales["tracking_lin_vel"]:
+    #         self.command_ranges["lin_vel_x"][0] = np.clip(self.command_ranges["lin_vel_x"][0] - 0.5, -self.cfg.commands.max_curriculum, 0.)
+    #         self.command_ranges["lin_vel_x"][1] = np.clip(self.command_ranges["lin_vel_x"][1] + 0.5, 0., self.cfg.commands.max_curriculum)
+
+
     def update_command_curriculum(self, env_ids):
-        """ Implements a curriculum of increasing commands
-
-        Args:
-            env_ids (List[int]): ids of environments being reset
         """
-        # If the tracking reward is above 80% of the maximum, increase the range of commands
-        if torch.mean(self.episode_sums["tracking_lin_vel"][env_ids]) / self.max_episode_length > 0.8 * self.reward_scales["tracking_lin_vel"]:
-            self.command_ranges["lin_vel_x"][0] = np.clip(self.command_ranges["lin_vel_x"][0] - 0.5, -self.cfg.commands.max_curriculum, 0.)
-            self.command_ranges["lin_vel_x"][1] = np.clip(self.command_ranges["lin_vel_x"][1] + 0.5, 0., self.cfg.commands.max_curriculum)
+        自定义课程更新：根据手倒立成功率提升命令难度
+        """
+        if not self.cfg.commands.curriculum:
+            return
 
+        # 只有当所有环境都达到一定成功率时，才提升难度
+        success_rate = self.compute_handstand_success_rate()
+        if success_rate > 0.8:  # 80% 环境成功
+            self.command_ranges["lin_vel_x"] = [
+                -self.cfg.commands.max_curriculum,
+                self.cfg.commands.max_curriculum
+            ]
+            self.command_ranges["lin_vel_y"] = [
+                -self.cfg.commands.max_curriculum,
+                self.cfg.commands.max_curriculum
+            ]
+            self.command_ranges["ang_vel_yaw"] = [
+                -self.cfg.commands.max_curriculum,
+                self.cfg.commands.max_curriculum
+            ]
+            # 注意：stand_handstand 命令范围保持 [0,1] 不变
 
     def _get_noise_scale_vec(self, cfg):
         """ Sets a vector used to scale the noise added to the observations.
@@ -538,26 +696,33 @@ class LeggedRobot(BaseTask):
         Returns:
             [torch.Tensor]: Vector of scales used to multiply a uniform distribution in [-1, 1]
         """
-        noise_vec = torch.zeros_like(self.obs_buf[0])
+        # 直接使用配置中的观测维度，而不是依赖 self.obs_buf
+        obs_dim = self.cfg.env.num_observations
+        noise_vec = torch.zeros(obs_dim, device=self.device)  # 直接创建，不依赖 obs_buf
+        
         self.add_noise = self.cfg.noise.add_noise
         noise_scales = self.cfg.noise.noise_scales
         noise_level = self.cfg.noise.noise_level
-        # noise_vec[:3] = noise_scales.lin_vel * noise_level * self.obs_scales.lin_vel
+        
+        # 根据观测结构设置噪声尺度
         noise_vec[:3] = noise_scales.ang_vel * noise_level * self.obs_scales.ang_vel
         noise_vec[3:6] = noise_scales.gravity * noise_level
-        noise_vec[6:9] = 0. # commands
-        noise_vec[9:21] = noise_scales.dof_pos * noise_level * self.obs_scales.dof_pos
-        noise_vec[21:33] = noise_scales.dof_vel * noise_level * self.obs_scales.dof_vel
-        noise_vec[33:45] = 0. # previous actions
-        if self.cfg.terrain.measure_heights:
-            noise_vec[45:232] = noise_scales.height_measurements* noise_level * self.obs_scales.height_measurements
+        noise_vec[6:10] = 0. # commands
+        noise_vec[10:22] = noise_scales.dof_pos * noise_level * self.obs_scales.dof_pos
+        noise_vec[22:34] = noise_scales.dof_vel * noise_level * self.obs_scales.dof_vel
+        noise_vec[34:46] = 0. # previous actions
+        # noise_vec[45] = 0. # 新增的命令维度
+        
+        # 添加调试信息
+        print(f"创建的噪声向量维度: {noise_vec.shape[0]}, 配置观测维度: {obs_dim}")
+        
         return noise_vec
-
     #----------------------------------------
     def _init_buffers(self):
         """ Initialize torch tensors which will contain simulation states and processed quantities
         """
         # get gym GPU state tensors
+        
         actor_root_state = self.gym.acquire_actor_root_state_tensor(self.sim)
         dof_state_tensor = self.gym.acquire_dof_state_tensor(self.sim)
         net_contact_forces = self.gym.acquire_net_contact_force_tensor(self.sim)
@@ -583,9 +748,20 @@ class LeggedRobot(BaseTask):
         # initialize some data used later on
         self.common_step_counter = 0
         self.extras = {}
+        # 在初始化 noise_scale_vec 之前添加调试
+        print(f"=== 初始化调试 ===")
+        print(f"配置中的观测维度: {self.cfg.env.num_observations}")
+        
+        # 先创建 obs_buf
+        self.obs_buf = torch.zeros(self.num_envs, self.cfg.env.num_observations, 
+                                device=self.device, requires_grad=False)
+        print(f"创建的 obs_buf 形状: {self.obs_buf.shape}")
+        
+        # 然后创建 noise_scale_vec
         self.noise_scale_vec = self._get_noise_scale_vec(self.cfg)
+        print(f"创建的 noise_scale_vec 形状: {self.noise_scale_vec.shape}")
         self.gravity_vec = to_torch(get_axis_params(-1., self.up_axis_idx), device=self.device).repeat((self.num_envs, 1))
-        self.forward_vec = to_torch([1., 0., 0.], device=self.device).repeat((self.num_envs, 1))
+        self.forward_vec = to_torch([-1., 0., 0.], device=self.device).repeat((self.num_envs, 1))
         self.torques = torch.zeros(self.num_envs, self.num_actions, dtype=torch.float, device=self.device, requires_grad=False)
         self.p_gains = torch.zeros(self.num_actions, dtype=torch.float, device=self.device, requires_grad=False)
         self.d_gains = torch.zeros(self.num_actions, dtype=torch.float, device=self.device, requires_grad=False)
@@ -593,8 +769,8 @@ class LeggedRobot(BaseTask):
         self.last_actions = torch.zeros(self.num_envs, self.num_actions, dtype=torch.float, device=self.device, requires_grad=False)
         self.last_dof_vel = torch.zeros_like(self.dof_vel)
         self.last_root_vel = torch.zeros_like(self.root_states[:, 7:13])
-        self.commands = torch.zeros(self.num_envs, self.cfg.commands.num_commands, dtype=torch.float, device=self.device, requires_grad=False) # x vel, y vel, yaw vel, heading
-        self.commands_scale = torch.tensor([self.obs_scales.lin_vel, self.obs_scales.lin_vel, self.obs_scales.ang_vel], device=self.device, requires_grad=False,) # TODO change this
+        self.commands = torch.zeros(self.num_envs, self.cfg.commands.num_commands, dtype=torch.float, device=self.device, requires_grad=False) # x vel, y vel, yaw vel, heading, stand_handstand
+        self.commands_scale = torch.tensor([self.obs_scales.lin_vel, self.obs_scales.lin_vel, self.obs_scales.ang_vel, 1.0], device=self.device, requires_grad=False,) # TODO change this
         self.feet_air_time = torch.zeros(self.num_envs, self.feet_indices.shape[0], dtype=torch.float, device=self.device, requires_grad=False)
         self.last_contacts = torch.zeros(self.num_envs, len(self.feet_indices), dtype=torch.bool, device=self.device, requires_grad=False)
         self.base_lin_vel = quat_rotate_inverse(self.base_quat, self.root_states[:, 7:10])
@@ -633,6 +809,11 @@ class LeggedRobot(BaseTask):
         self.target_gravity_vec[:] = torch.tensor([0., 0., -1.], device=self.device)  # 初始为站立姿态
         # 添加缺失的 transition_speed 初始化
         self.transition_speed = torch_rand_float(0.5, 1.5, (self.num_envs, 1), device=self.device).squeeze(1)
+        
+        # 新增：站立/手倒立状态变量
+        self.stand_handstand_state = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)  # 0:站立, 1:手倒立
+        self.current_stand_handstand_state = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)  # 当前状态
+        self.transition_in_progress = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)  # 是否正在进行转换
         
         # 调试：打印所有刚体名称
         print("=== 所有刚体名称 ===")
@@ -1008,29 +1189,29 @@ class LeggedRobot(BaseTask):
     #     self.feet_air_time *= ~contact_filt
     #     return rew_airTime
     
-    def _reward_feet_air_time(self):
-        # Reward long steps
-        # Need to filter the contacts because the contact reporting of PhysX is unreliable on meshes
-        contact = self.contact_forces[:, self.feet_indices, 2] > 1.
+    # def _reward_feet_air_time(self):
+    #     # Reward long steps
+    #     # Need to filter the contacts because the contact reporting of PhysX is unreliable on meshes
+    #     contact = self.contact_forces[:, self.feet_indices, 2] > 1.
         
-        # 添加维度检查和调整
-        if contact.shape != self.last_contacts.shape:
-            print(f"Warning: Dimension mismatch - contact: {contact.shape}, last_contacts: {self.last_contacts.shape}")
-            # 自动调整到最小公共维度
-            min_feet = min(contact.shape[1], self.last_contacts.shape[1])
-            contact = contact[:, :min_feet]
-            self.last_contacts = self.last_contacts[:, :min_feet]
-            # 同时调整 feet_air_time 的维度
-            self.feet_air_time = self.feet_air_time[:, :min_feet]
+    #     # 添加维度检查和调整
+    #     if contact.shape != self.last_contacts.shape:
+    #         print(f"Warning: Dimension mismatch - contact: {contact.shape}, last_contacts: {self.last_contacts.shape}")
+    #         # 自动调整到最小公共维度
+    #         min_feet = min(contact.shape[1], self.last_contacts.shape[1])
+    #         contact = contact[:, :min_feet]
+    #         self.last_contacts = self.last_contacts[:, :min_feet]
+    #         # 同时调整 feet_air_time 的维度
+    #         self.feet_air_time = self.feet_air_time[:, :min_feet]
         
-        contact_filt = torch.logical_or(contact, self.last_contacts) 
-        self.last_contacts = contact
-        first_contact = (self.feet_air_time > 0.) * contact_filt
-        self.feet_air_time += self.dt
-        rew_airTime = torch.sum((self.feet_air_time - 0.5) * first_contact, dim=1)
-        rew_airTime *= torch.norm(self.commands[:, :2], dim=1) > 0.1
-        self.feet_air_time *= ~contact_filt
-        return rew_airTime
+    #     contact_filt = torch.logical_or(contact, self.last_contacts) 
+    #     self.last_contacts = contact
+    #     first_contact = (self.feet_air_time > 0.) * contact_filt
+    #     self.feet_air_time += self.dt
+    #     rew_airTime = torch.sum((self.feet_air_time - 0.5) * first_contact, dim=1)
+    #     rew_airTime *= torch.norm(self.commands[:, :2], dim=1) > 0.1
+    #     self.feet_air_time *= ~contact_filt
+    #     return rew_airTime
 
     def _reward_stumble(self):
         # Penalize feet hitting vertical surfaces
@@ -1122,175 +1303,484 @@ class LeggedRobot(BaseTask):
         
     #     return reward
         
-    def _reward_handstand_feet_height_exp(self):
-        """优化版：基于0.022米阈值的抬腿判断"""
+    # def _reward_handstand_feet_height_exp(self):
+    #     """优化版：基于0.022米阈值的抬腿判断"""
         
-        # 1. 获取相关刚体索引
-        thigh_indices = [2, 6, 10, 14]    # FL_THIGH, FR_THIGH, HL_THIGH, HR_THIGH
-        shank_indices = [3, 7, 11, 15]    # FL_SHANK, FR_SHANK, HL_SHANK, HR_SHANK
-        foot_indices = [4, 8, 12, 16]     # FL_FOOT, FR_FOOT, HL_FOOT, HR_FOOT
+    #     # 1. 获取相关刚体索引
+    #     thigh_indices = [2, 6, 10, 14]    # FL_THIGH, FR_THIGH, HL_THIGH, HR_THIGH
+    #     shank_indices = [3, 7, 11, 15]    # FL_SHANK, FR_SHANK, HL_SHANK, HR_SHANK
+    #     foot_indices = [4, 8, 12, 16]     # FL_FOOT, FR_FOOT, HL_FOOT, HR_FOOT
         
-        # 2. 计算膝盖离地高度
-        shank_pos = self.rigid_body_pos[:, shank_indices, :]
-        knee_heights = shank_pos[..., 2]
+    #     # 2. 计算膝盖离地高度
+    #     shank_pos = self.rigid_body_pos[:, shank_indices, :]
+    #     knee_heights = shank_pos[..., 2]
         
-        # 膝盖安全高度阈值
-        knee_safe_height = 0.05
-        knee_height_penalty = torch.sum(torch.where(knee_heights < knee_safe_height,
-                                                (knee_safe_height - knee_heights) ** 2, 0.0), dim=1)
-        knee_safety_reward = torch.exp(-knee_height_penalty / 0.05)
+    #     # 膝盖安全高度阈值
+    #     knee_safe_height = 0.05
+    #     knee_height_penalty = torch.sum(torch.where(knee_heights < knee_safe_height,
+    #                                             (knee_safe_height - knee_heights) ** 2, 0.0), dim=1)
+    #     knee_safety_reward = torch.exp(-knee_height_penalty / 0.05)
         
-        # 3. 前腿脚部高度奖励 - 关键修改：基于0.022米阈值
-        front_foot_indices = [4, 8]
-        front_foot_tensor = torch.tensor(front_foot_indices, dtype=torch.long, device=self.rigid_body_pos.device)
-        front_foot_pos = self.rigid_body_pos[:, front_foot_tensor, :]
-        front_foot_height = front_foot_pos[..., 2]
-        front_foot_x = front_foot_pos[..., 0]
+    #     # 3. 前腿脚部高度奖励 - 关键修改：基于0.022米阈值
+    #     front_foot_indices = [4, 8]
+    #     front_foot_tensor = torch.tensor(front_foot_indices, dtype=torch.long, device=self.rigid_body_pos.device)
+    #     front_foot_pos = self.rigid_body_pos[:, front_foot_tensor, :]
+    #     front_foot_height = front_foot_pos[..., 2]
+    #     front_foot_x = front_foot_pos[..., 0]
         
-        target_height = self.cfg.params.handstand_feet_height_exp["target_height"]
+    #     target_height = self.cfg.params.handstand_feet_height_exp["target_height"]
         
-        # 定义抬腿阈值
-        LIFT_THRESHOLD = 0.025  # 高度大于0.022米才算是抬腿
+    #     # 定义抬腿阈值
+    #     LIFT_THRESHOLD = 0.025  # 高度大于0.022米才算是抬腿
         
-        # 分别获取左右前腿高度
-        front_left_height = front_foot_height[:, 0]
-        front_right_height = front_foot_height[:, 1]
+    #     # 分别获取左右前腿高度
+    #     front_left_height = front_foot_height[:, 0]
+    #     front_right_height = front_foot_height[:, 1]
         
-        # 判断每条腿的状态
-        left_leg_lifted = front_left_height > LIFT_THRESHOLD  # 左腿是否抬离地面
-        right_leg_lifted = front_right_height > LIFT_THRESHOLD  # 右腿是否抬离地面
-        both_legs_lifted = left_leg_lifted & right_leg_lifted  # 双腿都抬离
-        any_leg_lifted = left_leg_lifted | right_leg_lifted  # 任意腿抬离
+    #     # 判断每条腿的状态
+    #     left_leg_lifted = front_left_height > LIFT_THRESHOLD  # 左腿是否抬离地面
+    #     right_leg_lifted = front_right_height > LIFT_THRESHOLD  # 右腿是否抬离地面
+    #     both_legs_lifted = left_leg_lifted & right_leg_lifted  # 双腿都抬离
+    #     any_leg_lifted = left_leg_lifted | right_leg_lifted  # 任意腿抬离
         
-        # 计算实际抬腿高度（只考虑抬离地面的腿）
-        left_lift_amount = torch.clamp(front_left_height - LIFT_THRESHOLD, 0)
-        right_lift_amount = torch.clamp(front_right_height - LIFT_THRESHOLD, 0)
-        total_lift_amount = left_lift_amount + right_lift_amount
+    #     # 计算实际抬腿高度（只考虑抬离地面的腿）
+    #     left_lift_amount = torch.clamp(front_left_height - LIFT_THRESHOLD, 0)
+    #     right_lift_amount = torch.clamp(front_right_height - LIFT_THRESHOLD, 0)
+    #     total_lift_amount = left_lift_amount + right_lift_amount
         
-        # 新策略：基于抬腿状态的奖励系统
-        # 1. 基础抬腿奖励（鼓励至少一条腿抬离地面）
-        base_lift_reward = any_leg_lifted.float() * 0.3
+    #     # 新策略：基于抬腿状态的奖励系统
+    #     # 1. 基础抬腿奖励（鼓励至少一条腿抬离地面）
+    #     base_lift_reward = any_leg_lifted.float() * 0.3
         
-        # 2. 单腿抬高奖励（鼓励抬得更高）
-        single_leg_reward = (
-            torch.max(left_lift_amount, right_lift_amount) / (target_height - LIFT_THRESHOLD)
-        ) * 0.4
+    #     # 2. 单腿抬高奖励（鼓励抬得更高）
+    #     single_leg_reward = (
+    #         torch.max(left_lift_amount, right_lift_amount) / (target_height - LIFT_THRESHOLD)
+    #     ) * 0.4
         
-        # 3. 双腿协调奖励（鼓励双腿都抬离地面）
-        both_legs_reward = both_legs_lifted.float() * 0.5
-        min_lift_reward = (
-            torch.min(left_lift_amount, right_lift_amount) / (target_height - LIFT_THRESHOLD)
-        ) * 0.3
+    #     # 3. 双腿协调奖励（鼓励双腿都抬离地面）
+    #     both_legs_reward = both_legs_lifted.float() * 0.5
+    #     min_lift_reward = (
+    #         torch.min(left_lift_amount, right_lift_amount) / (target_height - LIFT_THRESHOLD)
+    #     ) * 0.3
         
-        # 4. 交替模式特别奖励（一条腿抬高，一条腿支撑）
-        alternation_condition = (left_leg_lifted & ~right_leg_lifted) | (~left_leg_lifted & right_leg_lifted)
-        alternation_reward = alternation_condition.float() * 0.4
+    #     # 4. 交替模式特别奖励（一条腿抬高，一条腿支撑）
+    #     alternation_condition = (left_leg_lifted & ~right_leg_lifted) | (~left_leg_lifted & right_leg_lifted)
+    #     alternation_reward = alternation_condition.float() * 0.4
         
-        # 5. 目标高度奖励（针对已抬离的腿）
-        lifted_heights = torch.where(any_leg_lifted.unsqueeze(1), front_foot_height, torch.tensor(LIFT_THRESHOLD, device=self.device))
-        height_error = torch.sum((lifted_heights - target_height) ** 2, dim=1)
-        target_reward = torch.exp(-height_error / 0.3) * 0.6
+    #     # 5. 目标高度奖励（针对已抬离的腿）
+    #     lifted_heights = torch.where(any_leg_lifted.unsqueeze(1), front_foot_height, torch.tensor(LIFT_THRESHOLD, device=self.device))
+    #     height_error = torch.sum((lifted_heights - target_height) ** 2, dim=1)
+    #     target_reward = torch.exp(-height_error / 0.3) * 0.6
         
-        # 组合高度奖励
-        height_reward = (
-            base_lift_reward +
-            single_leg_reward + 
-            both_legs_reward +
-            min_lift_reward +
-            alternation_reward +
-            target_reward
-        )
+    #     # 组合高度奖励
+    #     height_reward = (
+    #         base_lift_reward +
+    #         single_leg_reward + 
+    #         both_legs_reward +
+    #         min_lift_reward +
+    #         alternation_reward +
+    #         target_reward
+    #     )
         
-        # 4. 抬腿不足惩罚（针对应该抬腿但没抬的情况）
-        # 如果机器人的最大高度已经超过阈值，但某条腿还在地上，给予惩罚
-        if hasattr(self, 'max_achieved_height'):
-            should_lift = self.max_achieved_height > LIFT_THRESHOLD * 2  # 如果曾经达到较高高度
-            lift_penalty = torch.where(
-                should_lift & ~both_legs_lifted,
-                (1.0 - both_legs_lifted.float()) * 0.2,  # 惩罚没抬腿的情况
-                0.0
-            )
-        else:
-            lift_penalty = torch.zeros(self.num_envs, device=self.device)
-            self.max_achieved_height = torch.max(front_foot_height, dim=1)[0]
+    #     # 4. 抬腿不足惩罚（针对应该抬腿但没抬的情况）
+    #     # 如果机器人的最大高度已经超过阈值，但某条腿还在地上，给予惩罚
+    #     if hasattr(self, 'max_achieved_height'):
+    #         should_lift = self.max_achieved_height > LIFT_THRESHOLD * 2  # 如果曾经达到较高高度
+    #         lift_penalty = torch.where(
+    #             should_lift & ~both_legs_lifted,
+    #             (1.0 - both_legs_lifted.float()) * 0.2,  # 惩罚没抬腿的情况
+    #             0.0
+    #         )
+    #     else:
+    #         lift_penalty = torch.zeros(self.num_envs, device=self.device)
+    #         self.max_achieved_height = torch.max(front_foot_height, dim=1)[0]
         
-        # 更新最大高度
-        self.max_achieved_height = torch.max(self.max_achieved_height, torch.max(front_foot_height, dim=1)[0])
+    #     # 更新最大高度
+    #     self.max_achieved_height = torch.max(self.max_achieved_height, torch.max(front_foot_height, dim=1)[0])
         
-        # 5. 前腿向后伸展惩罚
-        backward_penalty_threshold = 0.0
-        backward_penalty = torch.sum(torch.where(front_foot_x < backward_penalty_threshold,
-                                            (backward_penalty_threshold - front_foot_x) ** 2, 0.0), dim=1)
-        backward_penalty_reward = torch.exp(-backward_penalty / 0.1)
+    #     # 5. 前腿向后伸展惩罚
+    #     backward_penalty_threshold = 0.0
+    #     backward_penalty = torch.sum(torch.where(front_foot_x < backward_penalty_threshold,
+    #                                         (backward_penalty_threshold - front_foot_x) ** 2, 0.0), dim=1)
+    #     backward_penalty_reward = torch.exp(-backward_penalty / 0.1)
         
-        # 6. 后腿稳定性奖励
-        hind_foot_indices = [12, 16]
-        hind_foot_tensor = torch.tensor(hind_foot_indices, dtype=torch.long, device=self.rigid_body_pos.device)
-        hind_foot_pos = self.rigid_body_pos[:, hind_foot_tensor, :]
-        hind_foot_height = hind_foot_pos[..., 2]
-        hind_target_height = 0.05
-        hind_height_error = torch.sum((hind_foot_height - hind_target_height) ** 2, dim=1)
-        hind_reward = torch.exp(-hind_height_error / 0.05)
+    #     # 6. 后腿稳定性奖励
+    #     hind_foot_indices = [12, 16]
+    #     hind_foot_tensor = torch.tensor(hind_foot_indices, dtype=torch.long, device=self.rigid_body_pos.device)
+    #     hind_foot_pos = self.rigid_body_pos[:, hind_foot_tensor, :]
+    #     hind_foot_height = hind_foot_pos[..., 2]
+    #     hind_target_height = 0.05
+    #     hind_height_error = torch.sum((hind_foot_height - hind_target_height) ** 2, dim=1)
+    #     hind_reward = torch.exp(-hind_height_error / 0.05)
         
-        # 7. 组合奖励
-        combined_reward_before = (
-            knee_safety_reward * 0.2 +
-            height_reward * 0.8 +
-            backward_penalty_reward * 0. +
-            hind_reward * 0. -
-            lift_penalty  # 抬腿不足惩罚
-        )
+    #     # 7. 组合奖励
+    #     combined_reward_before = (
+    #         knee_safety_reward * 0.2 +
+    #         height_reward * 0.8 +
+    #         backward_penalty_reward * 0. +
+    #         hind_reward * 0. -
+    #         lift_penalty  # 抬腿不足惩罚
+    #     )
         
-        # 8. 强惩罚：膝盖触地
-        severe_knee_contact = torch.any(knee_heights < 0.05, dim=1)
-        combined_reward = combined_reward_before.clone()
-        combined_reward[severe_knee_contact] = 0.0
+    #     # 8. 强惩罚：膝盖触地
+    #     severe_knee_contact = torch.any(knee_heights < 0.05, dim=1)
+    #     combined_reward = combined_reward_before.clone()
+    #     combined_reward[severe_knee_contact] = 0.0
         
-        # 9. 详细调试信息
-        for i in range(min(3, severe_knee_contact.shape[0])):
-            min_height = knee_heights[i].min().item()
-            contact = severe_knee_contact[i].item()
-            reward_before = combined_reward_before[i].item()
-            reward_after = combined_reward[i].item()
-            
-            # 获取前腿信息
-            left_height = front_left_height[i].item()
-            right_height = front_right_height[i].item()
-            left_lifted = left_leg_lifted[i].item()
-            right_lifted = right_leg_lifted[i].item()
-            left_lift_amt = left_lift_amount[i].item()
-            right_lift_amt = right_lift_amount[i].item()
-            
-            print(f"环境{i}: 最低膝高={min_height:.3f}, 触地={contact}")
-            print(f"  抬腿状态 (阈值={LIFT_THRESHOLD:.3f}m):")
-            print(f"    - 左腿: 高度={left_height:.3f}m, 抬腿={left_lifted}, 抬升量={left_lift_amt:.3f}m")
-            print(f"    - 右腿: 高度={right_height:.3f}m, 抬腿={right_lifted}, 抬升量={right_lift_amt:.3f}m")
-            print(f"    - 状态: 单腿抬离={any_leg_lifted[i].item()}, 双腿抬离={both_legs_lifted[i].item()}")
-            
-            print(f"  奖励分量:")
-            print(f"    - 基础抬腿: {base_lift_reward[i].item():.3f}")
-            print(f"    - 单腿抬高: {single_leg_reward[i].item():.3f}")
-            print(f"    - 双腿协调: {both_legs_reward[i].item():.3f}")
-            print(f"    - 最小抬腿: {min_lift_reward[i].item():.3f}")
-            print(f"    - 交替模式: {alternation_reward[i].item():.3f}")
-            print(f"    - 目标奖励: {target_reward[i].item():.3f}")
-            print(f"    - 抬腿惩罚: -{lift_penalty[i].item():.3f}")
-            
-            print(f"  奖励汇总: 惩罚前={reward_before:.3f}, 惩罚后={reward_after:.3f}")
-            
-            # 给出行为建议
-            if not left_lifted and not right_lifted:
-                print(f"  💡 建议: 两条腿都还在地上，尝试抬起至少一条腿")
-            elif left_lifted and not right_lifted:
-                print(f"  💡 建议: 左腿已抬起，可以尝试抬起右腿或继续抬高左腿")
-            elif not left_lifted and right_lifted:
-                print(f"  💡 建议: 右腿已抬起，可以尝试抬起左腿或继续抬高右腿")
-            else:
-                print(f"  💡 建议: 双腿都已抬起！继续向目标高度{target_height:.2f}m努力")
+    #     # 9. 根据站立/手倒立命令调整奖励
+    #     # 如果命令是站立(0)，但脚部高度过高，应给予惩罚
+    #     standing_command = (self.stand_handstand_state == 0)
+    #     handstand_command = (self.stand_handstand_state == 1)
+        
+    #     # 站立命令时，脚部应接近地面
+    #     standing_penalty = standing_command.float() * (
+    #         torch.exp(-torch.min(front_foot_height, dim=1)[0] / 0.1)  # 鼓励脚部接近地面
+    #     )
+        
+    #     # 手倒立命令时，脚部应抬高
+    #     handstand_reward = handstand_command.float() * height_reward
+        
+    #     # 最终奖励：根据命令选择适当的奖励
+    #     final_reward = standing_penalty + handstand_reward
+        
+    #     # 10. 详细调试信息
+    #     if self.common_step_counter % 50 == 0:
+    #         for i in range(min(1, severe_knee_contact.shape[0])):  # 只打印第一个环境的调试信息
+    #             min_height = knee_heights[i].min().item()
+    #             contact = severe_knee_contact[i].item()
+    #             reward_before = combined_reward_before[i].item()
+    #             reward_after = combined_reward[i].item()
                 
-            print(f"  {'='*60}")
+    #             # 获取前腿信息
+    #             left_height = front_left_height[i].item()
+    #             right_height = front_right_height[i].item()
+    #             left_lifted = left_leg_lifted[i].item()
+    #             right_lifted = right_leg_lifted[i].item()
+    #             left_lift_amt = left_lift_amount[i].item()
+    #             right_lift_amt = right_lift_amount[i].item()
+                
+    #             command_state = self.stand_handstand_state[i].item()
+                
+    #             print(f"环境{i}: 最低膝高={min_height:.3f}, 触地={contact}, 命令状态={command_state}")
+    #             print(f"  抬腿状态 (阈值={LIFT_THRESHOLD:.3f}m):")
+    #             print(f"    - 左腿: 高度={left_height:.3f}m, 抬腿={left_lifted}, 抬升量={left_lift_amt:.3f}m")
+    #             print(f"    - 右腿: 高度={right_height:.3f}m, 抬腿={right_lifted}, 抬升量={right_lift_amt:.3f}m")
+    #             print(f"    - 状态: 单腿抬离={any_leg_lifted[i].item()}, 双腿抬离={both_legs_lifted[i].item()}")
+                
+    #             print(f"  奖励分量:")
+    #             print(f"    - 基础抬腿: {base_lift_reward[i].item():.3f}")
+    #             print(f"    - 单腿抬高: {single_leg_reward[i].item():.3f}")
+    #             print(f"    - 双腿协调: {both_legs_reward[i].item():.3f}")
+    #             print(f"    - 最小抬腿: {min_lift_reward[i].item():.3f}")
+    #             print(f"    - 交替模式: {alternation_reward[i].item():.3f}")
+    #             print(f"    - 目标奖励: {target_reward[i].item():.3f}")
+    #             print(f"    - 抬腿惩罚: -{lift_penalty[i].item():.3f}")
+    #             print(f"    - 站立惩罚: {standing_penalty[i].item():.3f}")
+    #             print(f"    - 倒立奖励: {handstand_reward[i].item():.3f}")
+                
+    #             print(f"  奖励汇总: 惩罚前={reward_before:.3f}, 惩罚后={reward_after:.3f}, 最终={final_reward[i].item():.3f}")
+                
+    #             # 给出行为建议
+    #             if command_state == 0:
+    #                 print(f"  💡 建议: 当前命令为站立，应保持脚部接近地面")
+    #             else:
+    #                 print(f"  💡 建议: 当前命令为手倒立，应抬起脚部")
+                    
+    #             print(f"  {'='*60}")
 
-        return combined_reward
+    #     return final_reward
+    # def _reward_handstand_feet_height_exp(self):
+    #     """基于课程学习的优化版：三阶段手倒立训练奖励函数（含前腿高度对称性约束 + 防止向后摆腿）"""
+        
+    #     # 1. 获取相关刚体索引
+    #     thigh_indices = [2, 6, 10, 14]    # FL_THIGH, FR_THIGH, HL_THIGH, HR_THIGH
+    #     shank_indices = [3, 7, 11, 15]    # FL_SHANK, FR_SHANK, HL_SHANK, HR_SHANK
+    #     foot_indices = [4, 8, 12, 16]     # FL_FOOT, FR_FOOT, HL_FOOT, HR_FOOT
+        
+    #     # === 命令状态 ===
+    #     handstand_cmd = (self.stand_handstand_state == 1)   # (num_envs,)
+    #     standing_cmd = ~handstand_cmd
+
+    #     # 2. 计算膝盖离地高度（用于后续约束）
+    #     shank_pos = self.rigid_body_pos[:, shank_indices, :]
+    #     knee_heights = shank_pos[..., 2]
+        
+    #     # 获取当前课程阶段
+    #     stage = self.get_current_stage()  # 返回 0, 1, 或 2
+
+    #     # 3. 前腿脚部高度与X位置
+    #     front_foot_indices = [4, 8]
+    #     front_foot_tensor = torch.tensor(front_foot_indices, dtype=torch.long, device=self.rigid_body_pos.device)
+    #     front_foot_pos = self.rigid_body_pos[:, front_foot_tensor, :]
+    #     front_foot_height = front_foot_pos[..., 2]
+    #     front_foot_x = front_foot_pos[..., 0]
+        
+    #     target_height = self.cfg.params.handstand_feet_height_exp["target_height"]
+    #     symmetry_scale = self.cfg.params.handstand_feet_height_exp.get("symmetry_scale", 0.05)
+    #     min_front_x = self.cfg.params.handstand_feet_height_exp.get("min_front_foot_x", -0.25)
+
+    #     # 定义抬腿阈值
+    #     LIFT_THRESHOLD = 0.025
+
+    #     # 分别获取左右前腿高度
+    #     front_left_height = front_foot_height[:, 0]
+    #     front_right_height = front_foot_height[:, 1]
+    #     height_diff = torch.abs(front_left_height - front_right_height)
+        
+    #     left_leg_lifted = front_left_height > LIFT_THRESHOLD
+    #     right_leg_lifted = front_right_height > LIFT_THRESHOLD
+    #     both_legs_lifted = left_leg_lifted & right_leg_lifted
+    #     any_leg_lifted = left_leg_lifted | right_leg_lifted
+
+    #     # 初始化奖励分量
+    #     base_lift_reward = torch.zeros_like(front_left_height)
+    #     knee_safety_reward = torch.ones_like(front_left_height)
+    #     backward_penalty_reward = torch.ones_like(front_left_height)
+    #     symmetry_reward_value = torch.ones_like(front_left_height)
+    #     hip_forward_reward = torch.ones_like(front_left_height)
+    #     target_reward = torch.zeros_like(front_left_height)
+
+    #     if handstand_cmd.any():
+    #         mask = handstand_cmd
+
+    #         # —————— 阶段 0：前腿抬起 + 后脚着地 + 防止过度后移 ——————
+    #         if stage >= 0:
+    #             base_lift_reward[mask] = any_leg_lifted[mask].float() * 1.0
+                
+    #             # 后脚着地奖励
+    #             hind_foot_indices = [12, 16]
+    #             hind_foot_tensor = torch.tensor(hind_foot_indices, dtype=torch.long, device=self.rigid_body_pos.device)
+    #             hind_foot_pos = self.rigid_body_pos[:, hind_foot_tensor, :]
+    #             hind_foot_height = hind_foot_pos[..., 2]
+    #             hind_on_ground = torch.max(hind_foot_height, dim=1).values < 0.05
+    #             hind_on_ground_reward = hind_on_ground[mask].float() * 0.5
+    #             base_lift_reward[mask] += hind_on_ground_reward
+
+    #             # === 防止前脚过度后移 ===
+    #             excess_backward = torch.relu(min_front_x - front_foot_x)  # (num_envs, 2)
+    #             backward_penalty = torch.sum(excess_backward, dim=1)
+    #             backward_penalty_reward = torch.clamp(1.0 - backward_penalty / 0.5, min=0.0)
+
+    #             # === 鼓励髋关节前摆 ===
+    #             front_hip_indices = [1, 7]  # FL_HIPY, FR_HIPY
+    #             front_hip_angles = self.dof_pos[:, front_hip_indices]
+    #             target_hip_angle = torch.tensor([0.2, 0.2], device=self.device).unsqueeze(0)
+    #             hip_error = torch.sum((front_hip_angles - target_hip_angle) ** 2, dim=1)
+    #             hip_forward_reward = torch.exp(-hip_error / 0.1)
+
+    #         # —————— 阶段 1：加入膝盖不触地 + 对称性约束 ——————
+    #         if stage >= 1:
+    #             hind_knee_indices = [11, 15]
+    #             hind_knee_tensor = torch.tensor(hind_knee_indices, dtype=torch.long, device=self.rigid_body_pos.device)
+    #             hind_knee_pos = self.rigid_body_pos[:, hind_knee_tensor, :]
+    #             hind_knee_heights = hind_knee_pos[..., 2]
+    #             min_hind_knee = torch.min(hind_knee_heights, dim=1).values
+    #             knee_safe = min_hind_knee > 0.05
+                
+    #             knee_safety_reward[mask] = knee_safe[mask].float() * 0.5 + \
+    #                                     torch.exp(-(0.05 - min_hind_knee[mask]).clamp(min=0) / 0.02) * 0.5
+
+    #             symmetry_active = both_legs_lifted[mask]
+    #             sym_reward_temp = torch.exp(-height_diff[mask] / symmetry_scale)
+    #             symmetry_reward_value[mask] = torch.where(symmetry_active, sym_reward_temp, torch.ones_like(sym_reward_temp))
+
+    #         # —————— 阶段 2：目标高度奖励 ——————
+    #         if stage >= 2:
+    #             lifted_mask = any_leg_lifted.unsqueeze(1)
+    #             effective_height = torch.where(lifted_mask, front_foot_height, torch.full_like(front_foot_height, LIFT_THRESHOLD))
+    #             height_error = torch.sum((effective_height - target_height) ** 2, dim=1)
+    #             target_reward[mask] = torch.exp(-height_error[mask] / 0.1) * 1.0
+
+    #     # —————— 根据阶段组合奖励 ——————
+    #     if stage == 0:
+    #         combined_reward = base_lift_reward * 1.0
+    #     elif stage == 1:
+    #         combined_reward = (
+    #             base_lift_reward * 0.2 +
+    #             knee_safety_reward * 0.4 +
+    #             symmetry_reward_value * 0.1 +
+    #             hip_forward_reward * 0.3
+    #         )
+    #     else:  # stage == 2
+    #         combined_reward = (
+    #             base_lift_reward * 0.05 +
+    #             target_reward * 0.5 +
+    #             knee_safety_reward * 0.2  +
+    #             symmetry_reward_value * 0.15 +
+    #             hip_forward_reward * 0.1
+    #         )
+
+    #     # 应用方向性约束（所有阶段）
+    #     combined_reward = combined_reward * backward_penalty_reward
+
+    #     # ✅ 关键修复：不再全局硬惩罚膝盖触地！
+    #     # 膝盖约束仅通过 stage>=1 的 knee_safety_reward 软性体现
+    #     final_reward = combined_reward.clone()
+
+    #     # ========== 手部高度不足惩罚（可保留，但建议提高阈值或移除）==========
+    #     hand_lift_threshold = 0.03
+    #     hand_lift_insufficient = (front_left_height < hand_lift_threshold) | (front_right_height < hand_lift_threshold)
+    #     handstand_hand_failure = handstand_cmd & hand_lift_insufficient
+    #     final_reward = torch.where(handstand_hand_failure, torch.zeros_like(final_reward), final_reward)
+
+    #     # ========== 防止前脚甩飞 ==========
+    #     front_foot_x_abs_too_large = torch.any(torch.abs(front_foot_x) > 1.0, dim=1)
+    #     flyaway_failure = handstand_cmd & front_foot_x_abs_too_large
+    #     final_reward = torch.where(flyaway_failure, torch.zeros_like(final_reward), final_reward)
+
+    #     # ========== 站立命令下的奖励（保持不变）==========
+    #     standing_penalty = torch.zeros_like(final_reward)
+    #     if standing_cmd.any():
+    #         min_front_z = torch.min(front_foot_height, dim=1).values
+    #         z_reward = torch.exp(-min_front_z / 0.05)
+
+    #         base_x = self.root_states[:, 0]
+    #         front_foot_rel_x = front_foot_x - base_x.unsqueeze(1)
+    #         max_abs_rel_x = torch.max(torch.abs(front_foot_rel_x), dim=1).values
+    #         x_reward = torch.exp(-max_abs_rel_x / 0.1)
+
+    #         standing_penalty = standing_cmd.float() * z_reward * x_reward
+
+    #     # ========== 最终奖励 ==========
+    #     raw_final_reward = torch.where(handstand_cmd, final_reward, standing_penalty)
+
+    #     # ========== 课程学习更新 ==========
+    #     self.update_curriculum_stage()
+
+    #     # ========== 调试信息（保持不变）==========
+    #     if self.common_step_counter % 50 == 0:
+    #         i = 0
+    #         min_height = knee_heights[i].min().item()
+    #         contact = min_height < 0.04  # 仅用于打印
+    #         reward_before = combined_reward[i].item()
+    #         reward_after = final_reward[i].item()
+            
+    #         left_height = front_left_height[i].item()
+    #         right_height = front_right_height[i].item()
+    #         left_x = front_foot_x[i, 0].item()
+    #         right_x = front_foot_x[i, 1].item()
+    #         height_diff_val = height_diff[i].item()
+    #         left_lifted = left_leg_lifted[i].item()
+    #         right_lifted = right_leg_lifted[i].item()
+            
+    #         command_state = self.stand_handstand_state[i].item()
+    #         hand_failure = handstand_hand_failure[i].item()
+    #         sym_reward_i = symmetry_reward_value[i].item()
+    #         hip_reward_i = hip_forward_reward[i].item()
+    #         back_penalty_i = backward_penalty_reward[i].item()
+    #         flyaway_fail_i = flyaway_failure[i].item()
+            
+    #         print(f"阶段 {stage} | 环境{i}: 最低膝高={min_height:.3f}, 触地={contact}, 命令状态={command_state}")
+    #         print(f"  前脚状态:")
+    #         print(f"    - 左: 高度={left_height:.3f}m, X={left_x:.3f}m")
+    #         print(f"    - 右: 高度={right_height:.3f}m, X={right_x:.3f}m")
+    #         print(f"    - 高度差: {height_diff_val:.3f}m")
+    #         print(f"    - 抬腿: 左={left_lifted}, 右={right_lifted}")
+    #         print(f"  约束检查:")
+    #         print(f"    - 最小X阈值: {min_front_x:.3f}m")
+    #         print(f"    - 向后惩罚: {back_penalty_i:.3f}")
+    #         print(f"    - 髋关节奖励: {hip_reward_i:.3f}")
+    #         print(f"    - 对称奖励: {sym_reward_i:.3f}")
+    #         print(f"    - 甩飞失败: {flyaway_fail_i}")
+    #         print(f"  奖励: 惩罚前={reward_before:.3f}, 惩罚后={reward_after:.3f}, 最终={raw_final_reward[i].item():.3f}")
+            
+    #         if command_state == 1 and (left_x < min_front_x or right_x < min_front_x):
+    #             print(f"  💡 警告: 前脚过于靠后！应向前伸手（X ≥ {min_front_x:.2f}）")
+
+    #         print(f"  {'='*60}")
+
+    #     return raw_final_reward
+
+    # def get_current_stage(self):
+    #     """获取当前课程学习阶段"""
+    #     if not hasattr(self, 'curriculum_stage'):
+    #         self.curriculum_stage = 0
+    #     return self.curriculum_stage
+
+
+    # def compute_handstand_success_rate(self):
+    #     """
+    #     根据当前课程阶段动态判断手倒立是否成功：
+    #     - 阶段 0: 前脚抬起 + 后脚着地
+    #     - 阶段 1/2: 前脚抬起 + 后脚着地 + 后膝离地
+    #     """
+    #     handstand_envs = (self.stand_handstand_state == 1)
+    #     if not handstand_envs.any():
+    #         return 0.0
+
+    #     stage = self.get_current_stage()
+
+    #     # 前脚（FL_FOOT=4, FR_FOOT=8）必须抬高 >3cm
+    #     front_foot_height = self.rigid_body_pos[:, [4, 8], 2]
+    #     front_lifted = (front_foot_height > 0.03).all(dim=1)
+
+    #     # 后脚（HL_FOOT=12, HR_FOOT=16）必须着地 <5cm
+    #     hind_foot_height = self.rigid_body_pos[:, [12, 16], 2]
+    #     hind_on_ground = (hind_foot_height < 0.022).all(dim=1)
+
+    #     if stage == 0:
+    #         # 阶段0：不检查膝盖
+    #         success = front_lifted & hind_on_ground
+    #     else:
+    #         # 阶段1+：后膝（HL_SHANK=11, HR_SHANK=15）必须离地 >5cm
+    #         hind_knee_height = self.rigid_body_pos[:, [11, 15], 2]
+    #         hind_knee_clear = (hind_knee_height > 0.05).all(dim=1)
+    #         success = front_lifted & hind_on_ground & hind_knee_clear
+
+    #     # 仅对手倒立命令环境计数
+    #     final_success = success & handstand_envs
+    #     return final_success.float().mean().item()
+
+    # def update_curriculum_stage(self):
+    #     """安全更新手倒立课程阶段，并定期打印训练进度"""
+    #     # 初始化课程状态（仅一次）
+    #     if not hasattr(self, '_handstand_curriculum'):
+    #         self._handstand_curriculum = {
+    #             'stage': 0,
+    #             'thresholds': [0.2, 0.5],
+    #         }
+    #         print("[课程学习] 初始化手倒立课程：阶段 0")
+
+    #     current_stage = self._handstand_curriculum['stage']
+    #     if current_stage >= 2:
+    #         # 已到最终阶段，但仍可打印进度
+    #         if not hasattr(self, '_last_print_step'):
+    #             self._last_print_step = 0
+    #         if self.common_step_counter - self._last_print_step >= 100:
+    #             success_rate = self.compute_handstand_success_rate()
+    #             print(f"[课程进度] 🟢 阶段 {current_stage}（已完成）| 当前成功率: {success_rate:.2%}")
+    #             self._last_print_step = self.common_step_counter
+    #         return
+
+    #     success_rate = self.compute_handstand_success_rate()
+    #     thresholds = self._handstand_curriculum['thresholds']
+
+    #     # 定期打印进度（每100步）
+    #     if not hasattr(self, '_last_print_step'):
+    #         self._last_print_step = 0
+    #     if self.common_step_counter - self._last_print_step >= 100:
+    #         print(f"[课程进度] 📊 阶段 {current_stage} | 成功率: {success_rate:.2%} "
+    #             f"(目标: >{thresholds[current_stage]:.1%})")
+    #         self._last_print_step = self.common_step_counter
+
+    #     # 尝试升级阶段
+    #     if success_rate > thresholds[current_stage]:
+    #         self._handstand_curriculum['stage'] += 1
+    #         new_stage = self._handstand_curriculum['stage']
+    #         stage_desc = ["前腿抬起 + 后脚着地", "后膝离地", "目标高度"]
+    #         print(f"[课程学习] 🎯 进入阶段 {new_stage}: {stage_desc[new_stage]} "
+    #             f"(成功率: {success_rate:.2%} > {thresholds[current_stage]:.1%})")
+   
+    # def get_current_stage(self):
+    #     """安全获取当前手倒立课程阶段，首次调用自动初始化"""
+    #     if not hasattr(self, '_handstand_curriculum'):
+    #         self._handstand_curriculum = {
+    #             'stage': 0,
+    #             'thresholds': [0.2, 0.5],  # 阶段0→1需60%成功率，阶段1→2需70%
+    #         }
+    #     return self._handstand_curriculum['stage']
+
+
     # def _reward_handstand_feet_height_exp(self):
     #     feet_indices = [i for i, name in enumerate(self.rigid_body_names) if re.match(self.cfg.params.feet_name_reward["feet_name"], name)]
     #     # print(feet_indices)
@@ -1351,7 +1841,20 @@ class LeggedRobot(BaseTask):
         reward = ((~feet_contact).float().prod(dim=1) * 
                 (~knee_contact).float().prod(dim=1))
         
-        return reward
+        # 6. 根据站立/手倒立命令调整奖励
+        standing_command = (self.stand_handstand_state == 0)
+        handstand_command = (self.stand_handstand_state == 1)
+        
+        # 站立命令时，脚部应在地面
+        standing_reward = standing_command.float() * (~feet_contact).float().prod(dim=1)
+        
+        # 手倒立命令时，脚部应在空中
+        handstand_reward = handstand_command.float() * (feet_contact).float().prod(dim=1)  # 当所有脚部都接触时奖励
+        
+        # 最终奖励：根据命令选择适当的奖励
+        final_reward = standing_reward + handstand_reward
+        
+        return final_reward
     
     def _reward_handstand_feet_air_time(self):
         """
@@ -1394,45 +1897,28 @@ class LeggedRobot(BaseTask):
         # 添加膝盖接触惩罚：有膝盖接触时奖励为0
         rew_airTime = rew_airTime * (~any_knee_contact).float()
         
+        # 根据站立/手倒立命令调整奖励
+        standing_command = (self.stand_handstand_state == 0)
+        handstand_command = (self.stand_handstand_state == 1)
+        
+        # 站立命令时，脚部应在地面（时间奖励应为0或负值）
+        standing_penalty = standing_command.float() * torch.zeros_like(rew_airTime)
+        
+        # 手倒立命令时，脚部应在空中（时间奖励正常计算）
+        handstand_reward = handstand_command.float() * rew_airTime
+        
+        # 最终奖励：根据命令选择适当的奖励
+        final_reward = standing_penalty + handstand_reward
+        
         self.feet_air_time *= ~contact_filt
         
-        return rew_airTime
-
-    # def _reward_handstand_feet_air_time(self):
-    #     """
-    #     计算手倒立时足部空中时间奖励
-    #     """
-    #     threshold = self.cfg.params.handstand_feet_air_time["threshold"]
-
-    #     # 获取 "R.*_foot" 索引
-    #     feet_indices = [i for i, name in enumerate(self.rigid_body_names) if re.match(self.cfg.params.feet_name_reward["feet_name"], name)]
-    #     feet_indices_tensor = torch.tensor(feet_indices, dtype=torch.long, device=self.device)
-
-    #     # 计算当前接触状态
-    #     contact = self.contact_forces[:, feet_indices_tensor, 2] > 1.0  # (batch_size, num_feet)
-    #     if not hasattr(self,"last_contacts") or self.last_contacts.shape != contact.shape:
-    #         self.last_contacts = torch.zeros_like(contact,dtype=torch.bool,device=contact.device)
-            
-    #     if not hasattr(self,"feet_air_time") or self.feet_air_time.shape != contact.shape:
-    #         self.feet_air_time = torch.zeros_like(contact,dtype=torch.float,device=contact.device)
-    #     contact_filt = torch.logical_or(contact,self.last_contacts)
-    #     self.last_contacts=contact
-    #     first_contact = (self.feet_air_time > 0.0) * contact_filt
-    #     self.feet_air_time+=self.dt
-    #     rew_airTime = torch.sum((self.feet_air_time - threshold) * first_contact,dim=1)
-    #     # rew_airTime*=torch.norm(self.commands[:,:2],dim =1)>0.1
-    #     self.feet_air_time *= ~contact_filt
-        
-    #     #print(rew_airTime)
-    #     return rew_airTime
-        
-
+        return final_reward
 
     def _reward_handstand_orientation_l2(self):
         """
         姿态奖励：
         1. 使用 self.projected_gravity（机器人基座坐标系下的重力投影）来评估姿态。
-        2. 目标重力方向通过配置传入（例如 [1, 0, 0] 表示目标为竖直向上）。
+        2. 目标重力方向通过配置传入（例如 [-1, 0, 0] 表示目标为竖直向上）。
         3. 对比当前和目标重力方向的 L2 距离，偏差越大惩罚越大。
         """
         target_gravity = torch.tensor(
@@ -1440,7 +1926,18 @@ class LeggedRobot(BaseTask):
             device=self.device
         )
 
+        # 根据站立/手倒立命令调整目标姿态
+        standing_target = torch.tensor([0., 0., -1.], device=self.device)  # 站立时重力向下
+        handstand_target = torch.tensor([-1., 0., 0.], device=self.device)  # 手倒立时重力向侧
+        
+        # 根据命令选择目标姿态
+        standing_command = (self.stand_handstand_state == 0).unsqueeze(1).float()
+        handstand_command = (self.stand_handstand_state == 1).unsqueeze(1).float()
+        
+        target_gravity = standing_command * standing_target + handstand_command * handstand_target
+        
         return torch.sum((self.projected_gravity - target_gravity) ** 2, dim=1)
+    
     def _reward_joint_smoothness(self):
         """奖励关节运动的平滑性，惩罚剧烈的动作变化"""
         # 1. 动作变化率惩罚（相邻时间步动作差异）
@@ -1483,27 +1980,30 @@ class LeggedRobot(BaseTask):
     
     def _reward_progressive_orientation(self):
         """改进的渐进姿态奖励"""
-        # 计算当前姿态与目标姿态的角度误差
         current_gravity = torch.nn.functional.normalize(self.projected_gravity, dim=1)
         target_gravity = torch.nn.functional.normalize(self.target_gravity_vec, dim=1)
         
-        # 使用余弦相似度计算角度误差
         cos_similarity = torch.sum(current_gravity * target_gravity, dim=1)
         angle_error = torch.acos(torch.clamp(cos_similarity, -0.9999, 0.9999))
-    
-        # 根据过渡进度调整奖励标准
+
         progress = self.transition_progress
-        
-        # 初期容忍度大，后期要求精确
-        tolerance = torch.deg2rad(30.0 * (1.0 - progress) + 10.0)  # 从30度减小到10度
-        
-        # 分段奖励函数
+        # 确保 tolerance 是 tensor
+        tolerance_deg = 30.0 * (1.0 - progress) + 10.0
+        tolerance = torch.deg2rad(tolerance_deg)  # progress 是 tensor，所以 tolerance_deg 也是 tensor → OK!
+
         reward = torch.exp(-(angle_error / tolerance)**2)
         
-        # 添加进度奖励，鼓励持续进展但不过快
-        progress_reward = torch.tanh(progress * 2)  # 鼓励适当进展
+        standing_command = (self.stand_handstand_state == 0)
+        handstand_command = (self.stand_handstand_state == 1)
         
-        return reward * 0.8 + progress_reward * 0.2
+        # 🔧 修复：15.0 必须转为 tensor
+        tol_standing = torch.deg2rad(torch.tensor(15.0, device=self.device))
+        standing_reward = standing_command.float() * torch.exp(-(angle_error / tol_standing)**2)
+        
+        handstand_reward = handstand_command.float() * reward
+        
+        final_reward = standing_reward + handstand_reward
+        return final_reward
 
     def _reward_smooth_transition(self):
         """更强的平滑性奖励"""
@@ -1528,5 +2028,430 @@ class LeggedRobot(BaseTask):
             jerk_penalty * 0.02
         )
         
-        return -smoothness_penalty
+        # 根据转换状态调整平滑性奖励
+        transition_in_progress = self.transition_in_progress
         
+        # 在转换过程中，适当降低平滑性惩罚以允许必要的运动
+        adjusted_penalty = transition_in_progress.float() * smoothness_penalty * 0.5 + \
+                          (~transition_in_progress).float() * smoothness_penalty
+        
+        return -adjusted_penalty
+    
+    def _reward_standing_posture_and_contact(self):
+        """改进版：仅处理站立状态下的联合奖励
+        - 四足必须全部接触地面
+        - 关节角度接近 default_joint_angles
+        - 前脚不能过度后摆（相对躯干 X ≥ 阈值）
+        - 躯干高度接近 0.32 米
+        """
+        standing_cmd = (self.stand_handstand_state == 0)
+        if not standing_cmd.any():
+            return torch.zeros(self.num_envs, device=self.device)
+
+        # === 1. 四足接触地面 ===
+        feet_indices_tensor = torch.tensor(self.feet_indices, device=self.device)
+        feet_contact = self.contact_forces[:, feet_indices_tensor, 2] > 0.1
+        all_feet_on_ground = feet_contact.all(dim=1)
+
+        # === 2. 关节角度接近默认站立姿态 ===
+        default_angles_list = [
+            -0.02, -0.77, 1.54,  # FL_HIPY, FL_HIPX, FL_KNEE
+            0.02, -0.77, 1.54,  # HL_HIPY, HL_HIPX, HL_KNEE
+            -0.02, -0.77, 1.54,  # FR_HIPY, FR_HIPX, FR_KNEE
+            0.02, -0.77, 1.54,  # HR_HIPY, HR_HIPX, HR_KNEE
+        ]
+        target_angles = torch.tensor(default_angles_list, device=self.device, dtype=torch.float32)
+        angle_error = torch.sum((self.dof_pos - target_angles) ** 2, dim=1)
+        posture_reward = torch.exp(-5.0 * angle_error)  # 惩罚尺度：~0.45 rad RMS error → reward≈0.1
+
+        # === 3. 前脚相对位置约束（防止后拖）===
+        front_feet_indices = [4, 8]  # FL_FOOT=4, FR_FOOT=8
+        base_x = self.root_states[:, 0]  # (N,)
+        front_foot_x = self.rigid_body_pos[:, front_feet_indices, 0]  # (N, 2)
+        front_foot_rel_x = front_foot_x - base_x.unsqueeze(1)  # (N, 2)
+
+        min_rel_x_threshold = -0.10  # 允许前脚在躯干后方最多 10cm
+        front_feet_not_too_back = (front_foot_rel_x >= min_rel_x_threshold).all(dim=1)
+        position_reward = front_feet_not_too_back.float()
+
+        # === 4. 躯干高度奖励 ===
+        base_z = self.root_states[:, 2]
+        target_base_z = 0.32
+        base_height_error = torch.abs(base_z - target_base_z)
+        base_height_reward = torch.exp(-base_height_error / 0.02)  # 2cm 内高奖励
+
+        # === 5. 组合站立奖励 ===
+        standing_reward = (
+            all_feet_on_ground.float() *
+            posture_reward *
+            position_reward *
+            base_height_reward
+        )
+
+        # === 6. 仅在站立命令下生效 ===
+        return standing_cmd.float() * standing_reward
+        
+
+    # ==================== 新增奖励函数 ====================
+
+    def _reward_handstand_base_pitch(self):
+        """奖励躯干接近竖直（手倒立姿态）"""
+        handstand_cmd = (self.stand_handstand_state == 1)
+        if not handstand_cmd.any():
+            return torch.zeros(self.num_envs, device=self.device)
+
+        # 从 root_states 提取四元数 [x, y, z, w] -> [w, x, y, z]
+        quat = self.root_states[:, 3:7]  # [x, y, z, w] in Isaac Gym
+        # 转为 [w, x, y, z]
+        w, x, y, z = quat[:, 3], quat[:, 0], quat[:, 1], quat[:, 2]
+        
+        # 计算 pitch = arcsin(2*(w*y - z*x))
+        sinp = 2 * (w * y - z * x)
+        pitch = torch.asin(torch.clamp(sinp, -1.0, 1.0))  # [-π/2, π/2]
+
+        # 手倒立理想 pitch ≈ ±π/2
+        pitch_error = torch.abs(torch.abs(pitch) - math.pi / 2)
+        reward = torch.exp(-pitch_error / 0.3)  # 容忍 ~17° 误差
+        return handstand_cmd.float() * reward
+
+
+    def _reward_handstand_legs_relative_x(self):
+        """惩罚前腿相对躯干过度后移（防甩飞）"""
+        handstand_cmd = (self.stand_handstand_state == 1)
+        mask = handstand_cmd
+
+        # 默认奖励为1（站立时不惩罚）
+        reward = torch.ones(self.num_envs, device=self.device)
+
+        if not mask.any():
+            return reward
+
+        base_x = self.root_states[:, 0].unsqueeze(1)  # (N, 1)
+        front_foot_x = self.rigid_body_pos[:, [4, 8], 0]  # FL_FOOT=4, FR_FOOT=8
+        rel_x = front_foot_x - base_x  # 相对于躯干的X位置
+
+        # 允许前脚在躯干前方或略后方（>= -0.3m）
+        min_rel_x = -0.3
+        excess_backward = torch.relu(min_rel_x - rel_x)  # >0 表示太靠后
+        penalty = torch.sum(excess_backward, dim=1)
+        reward_val = torch.exp(-penalty / 0.2)
+
+        reward[mask] = reward_val[mask]
+        return reward
+
+
+    def _reward_handstand_hip_symmetry(self):
+        """鼓励左右髋关节角度对称"""
+        handstand_cmd = (self.stand_handstand_state == 1)
+        mask = handstand_cmd
+        reward = torch.ones(self.num_envs, device=self.device)
+
+        if not mask.any():
+            return reward
+
+        # 假设 DOF 顺序: [FL_HIPY=1, FR_HIPY=7, ...]
+        hip_angles = self.dof_pos[:, [1, 7]]
+        asymmetry = torch.abs(hip_angles[:, 0] - hip_angles[:, 1])
+        sym_reward = torch.exp(-asymmetry / 0.2)
+        reward[mask] = sym_reward[mask]
+        return reward
+
+
+    def _reward_handstand_target_height(self):
+        """阶段2：精准高度控制"""
+        handstand_cmd = (self.stand_handstand_state == 1)
+        if not handstand_cmd.any():
+            return torch.zeros(self.num_envs, device=self.device)
+
+        stage = self.get_current_stage()
+        if stage < 2:
+            return torch.zeros_like(handstand_cmd.float())
+
+        foot_z = self.rigid_body_pos[:, [4, 8], 2]  # 前脚高度
+        target = self.cfg.params.handstand_feet_height_exp["target_height"]  # 0.75
+        error = torch.mean((foot_z - target) ** 2, dim=1)
+        reward = torch.exp(-error / 0.1)
+        return handstand_cmd.float() * reward
+
+
+    # ==================== 保留但简化原函数 ====================
+
+    def _reward_handstand_feet_height_exp(self):
+        """
+        简化版：仅提供基础抬腿奖励（阶段0/1使用）
+        不再包含复杂逻辑，避免冲突
+        """
+        handstand_cmd = (self.stand_handstand_state == 1)
+        if not handstand_cmd.any():
+            return torch.zeros(self.num_envs, device=self.device)
+
+        # 前脚高度
+        front_foot_z = self.rigid_body_pos[:, [4, 8], 2]
+        LIFT_THRESHOLD = 0.025
+        any_lifted = (front_foot_z > LIFT_THRESHOLD).any(dim=1)
+
+        # 后脚着地
+        hind_foot_z = self.rigid_body_pos[:, [12, 16], 2]
+        hind_on_ground = (hind_foot_z < 0.05).all(dim=1)
+
+        reward = (any_lifted & hind_on_ground).float()
+        return handstand_cmd.float() * reward
+
+
+    # ==================== 修改课程成功判定 ====================
+
+    def compute_handstand_success_rate(self):
+        """
+        成功条件：
+        - 阶段0: 前脚抬起 + 后脚着地 + 躯干 pitch > 1.2 rad (~70°)
+        - 阶段1+: 额外要求后膝离地
+        """
+        handstand_envs = (self.stand_handstand_state == 1)
+        if not handstand_envs.any():
+            return 0.0
+
+        stage = self.get_current_stage()
+
+        # 前脚抬起 (>3cm)
+        front_foot_height = self.rigid_body_pos[:, [4, 8], 2]
+        front_lifted = (front_foot_height > 0.03).all(dim=1)
+
+        # 后脚着地 (<5cm)
+        hind_foot_height = self.rigid_body_pos[:, [12, 16], 2]
+        hind_on_ground = (hind_foot_height < 0.05).all(dim=1)
+
+        # 躯干姿态：pitch > 1.2 rad
+        quat = self.root_states[:, 3:7]
+        w, x, y, z = quat[:, 3], quat[:, 0], quat[:, 1], quat[:, 2]
+        sinp = 2 * (w * y - z * x)
+        pitch = torch.asin(torch.clamp(sinp, -1.0, 1.0))
+        upright = torch.abs(pitch) > 1.2  # ~70 degrees
+
+        if stage == 0:
+            success = front_lifted & hind_on_ground & upright
+        else:
+            # 后膝离地 (>5cm)
+            hind_knee_height = self.rigid_body_pos[:, [11, 15], 2]
+            hind_knee_clear = (hind_knee_height > 0.05).all(dim=1)
+            success = front_lifted & hind_on_ground & upright & hind_knee_clear
+
+        final_success = success & handstand_envs
+        return final_success.float().mean().item()
+
+
+    # ==================== 课程阶段更新（带打印） ====================
+
+    def update_curriculum_stage(self):
+        """安全更新手倒立课程阶段，并定期打印训练进度"""
+        if not hasattr(self, '_handstand_curriculum'):
+            self._handstand_curriculum = {
+                'stage': 0,
+                'thresholds': [0.4, 0.6],  # 阶段0→1: 40%, 阶段1→2: 60%
+            }
+            print("[课程学习] 初始化手倒立课程：阶段 0")
+
+        current_stage = self._handstand_curriculum['stage']
+        if current_stage >= 2:
+            if not hasattr(self, '_last_print_step'):
+                self._last_print_step = 0
+            if self.common_step_counter - self._last_print_step >= 100:
+                sr = self.compute_handstand_success_rate()
+                print(f"[课程进度] 🟢 阶段 {current_stage}（已完成）| 成功率: {sr:.2%}")
+                self._last_print_step = self.common_step_counter
+            return
+
+        success_rate = self.compute_handstand_success_rate()
+        thresholds = self._handstand_curriculum['thresholds']
+
+        if not hasattr(self, '_last_print_step'):
+            self._last_print_step = 0
+        if self.common_step_counter - self._last_print_step >= 100:
+            print(f"[课程进度] 📊 阶段 {current_stage} | 成功率: {success_rate:.2%} "
+                f"(目标: >{thresholds[current_stage]:.0%})")
+            self._last_print_step = self.common_step_counter
+
+        if success_rate > thresholds[current_stage]:
+            self._handstand_curriculum['stage'] += 1
+            new_stage = self._handstand_curriculum['stage']
+            desc = ["躯干竖直+前腿抬起", "后膝离地", "目标高度"]
+            print(f"[课程学习] 🎯 进入阶段 {new_stage}: {desc[new_stage]} "
+                f"(成功率: {success_rate:.2%} > {thresholds[current_stage]:.0%})")
+
+
+    def get_current_stage(self):
+        if not hasattr(self, '_handstand_curriculum'):
+            self._handstand_curriculum = {'stage': 0, 'thresholds': [0.4, 0.6]}
+        return self._handstand_curriculum['stage']
+    
+    def _debug_print_env0(self):
+        """打印环境 0 的详细状态（用于调试手倒立训练）"""
+        if self.common_step_counter % 50 != 0:  # 每50步打印一次，避免刷屏
+            return
+
+        env_id = 0
+        cmd_state = self.stand_handstand_state[env_id].item()
+        stage = self.get_current_stage()
+
+        if cmd_state != 1:
+            print(f"[Env0] 🟦 站立模式 | 阶段={stage}")
+            return
+
+        # 获取躯干位置和姿态
+        base_x = self.root_states[env_id, 0].item()
+        quat = self.root_states[env_id, 3:7]
+        w, x, y, z = quat[3], quat[0], quat[1], quat[2]
+        sinp = 2 * (w * y - z * x)
+        pitch = math.asin(max(-1.0, min(1.0, sinp)))
+
+        # 前脚信息
+        left_foot_z = self.rigid_body_pos[env_id, 4, 2].item()   # FL_FOOT
+        right_foot_z = self.rigid_body_pos[env_id, 8, 2].item()  # FR_FOOT
+        left_foot_x = self.rigid_body_pos[env_id, 4, 0].item()
+        right_foot_x = self.rigid_body_pos[env_id, 8, 0].item()
+
+        rel_left_x = left_foot_x - base_x
+        rel_right_x = right_foot_x - base_x
+
+        # 后脚/膝盖高度
+        hind_foot_z = self.rigid_body_pos[env_id, [12, 16], 2].mean().item()
+        hind_knee_z = self.rigid_body_pos[env_id, [11, 15], 2].mean().item()
+
+        # 成功率相关状态
+        front_lifted = (left_foot_z > 0.03) and (right_foot_z > 0.03)
+        hind_on_ground = hind_foot_z < 0.05
+        upright = abs(pitch) > 1.2
+        hind_knee_clear = hind_knee_z > 0.05
+
+        success_cond = {
+            'front_lifted': front_lifted,
+            'hind_on_ground': hind_on_ground,
+            'upright': upright,
+        }
+        if stage >= 1:
+            success_cond['hind_knee_clear'] = hind_knee_clear
+
+        success_now = all(success_cond.values())
+
+        # 打印
+        print(f"\n{'='*60}")
+        print(f"[Env0 Debug] Step={self.common_step_counter} | 阶段={stage} | 命令=手倒立")
+        print(f"  躯干: X={base_x:.3f}, Pitch={pitch:.2f} rad ({pitch*180/math.pi:.1f}°)")
+        print(f"  前脚高度: 左={left_foot_z:.3f}m, 右={right_foot_z:.3f}m")
+        print(f"  前脚相对X: 左={rel_left_x:.3f}m, 右={rel_right_x:.3f}m (阈值 ≥ -0.30)")
+        print(f"  后脚高度: {hind_foot_z:.3f}m | 后膝高度: {hind_knee_z:.3f}m")
+        print(f"  成功条件: {success_cond} → 当前成功: {success_now}")
+        
+        # 警告提示
+        if rel_left_x < -0.3 or rel_right_x < -0.3:
+            print("  💡 警告: 前脚过于靠后！应向前伸手")
+        if not upright:
+            print("  💡 警告: 躯干未竖直！需调整髋关节角度")
+        if not front_lifted:
+            print("  💡 建议: 继续抬高前腿（>3cm）")
+        
+        print(f"{'='*60}\n")
+
+
+    def _reward_standing(self):
+        """站立状态：四足着地 + 身体水平"""
+        # 判断是否处于 standing 模式（命令第4维 ≈ 0）
+        is_standing_cmd = self.commands[:, 3] < 0.5  # shape: [num_envs]
+
+        # 1. 身体水平
+        gravity_error = torch.sum((self.projected_gravity - torch.tensor([0., 0., -1.], device=self.device))**2, dim=1)
+        orientation_reward = torch.exp(-gravity_error / 0.02)
+
+        # 2. 四足着地
+        feet_z = self.rigid_body_pos[:, self.feet_indices, 2]
+        contact_reward = torch.exp(-torch.mean(feet_z, dim=1) / 0.1)
+
+        # 3. 关节接近默认姿态
+        joint_error = torch.mean((self.dof_pos - self.default_dof_pos)**2, dim=1)
+        posture_reward = torch.exp(-joint_error / 0.01)
+
+        total_reward = (
+            orientation_reward * 0.35 +
+            contact_reward * 0.3 +
+            posture_reward * 0.35
+        )
+
+        # ✅ 只在 standing 模式下生效！
+        return total_reward * is_standing_cmd.float()
+
+
+    def _reward_handstand(self):
+        is_handstand_cmd = self.commands[:, 3] > 0.5
+
+        # === 原有 reward 不变 ===
+        grav_x = self.projected_gravity[:, 0]
+        orientation_reward = torch.clamp(-grav_x, 0, 1)
+
+        front_feet_idx = [4, 8]
+        front_feet_z = self.rigid_body_pos[:, front_feet_idx, 2]
+        lift_reward = torch.mean(front_feet_z, dim=1) / 0.5
+
+        base_x = self.root_states[:, 0:1]
+        front_feet_x = self.rigid_body_pos[:, front_feet_idx, 0]
+        min_rel_x = torch.min(front_feet_x - base_x, dim=1).values
+        leg_back_penalty = torch.relu(-0.05 - min_rel_x)
+        position_reward = torch.exp(-leg_back_penalty * 20.0)
+
+        hind_feet_idx = [12, 16]
+        contact_forces = self.contact_forces[:, hind_feet_idx, 2]
+        support_reward = torch.clamp(torch.mean(contact_forces, dim=1) / 50.0, 0, 1)
+
+        # ✅ 新增：后膝离地奖励（关键！）
+        hind_knee_idx = [11, 15]  # 确保这是后膝/小腿
+        hind_knee_z = self.rigid_body_pos[:, hind_knee_idx, 2]  # shape: [N, 2]
+        min_knee_height = torch.min(hind_knee_z, dim=1).values  # 最低的那只膝盖
+
+        # 要求膝盖至少离地 0.1m（根据你的机器人尺寸调整）
+        KNEE_HEIGHT_TARGET = 0.10
+        knee_lift_reward = torch.clamp(min_knee_height / KNEE_HEIGHT_TARGET, 0, 1)
+
+        # 或者用指数奖励（更平滑）：
+        # knee_error = torch.relu(KNEE_HEIGHT_TARGET - min_knee_height)
+        # knee_lift_reward = torch.exp(-knee_error / 0.05)
+
+        total_reward = (
+            orientation_reward * 0.2 +
+            lift_reward * 0.2 +
+            position_reward * 0.2 +
+            support_reward * 0.2 +
+            knee_lift_reward * 0.2  # ← 新增项！
+        )
+
+        return total_reward * is_handstand_cmd.float()
+    
+
+    def _reward_feet_air_time(self):
+        is_handstand_cmd = self.commands[:, 3] > 0.5
+        feet_indices = [4, 8]  # 前脚
+
+        # 检测当前是否接触
+        contact = torch.norm(self.contact_forces[:, feet_indices, :], dim=-1) > 1.0
+        
+        # 【关键】记录接触发生前的空中时间（用于奖励）
+        # 如果现在接触了，且上一帧没接触 → 刚结束一次腾空
+        contact_transition = contact & (self.last_feet_contact == False)
+        
+        # 奖励：只在刚落地时发放一次
+        air_time_reward = torch.sum(
+            torch.clamp(self.feet_air_time - 0.1, min=0.0) * contact_transition,
+            dim=1
+        )
+        
+        # 更新空中时间计时器
+        self.feet_air_time += self.dt
+        self.feet_air_time *= ~contact  # 接触时清零
+        
+        # 更新 last contact 状态
+        self.last_feet_contact = contact.clone()
+        
+        return air_time_reward * is_handstand_cmd.float()
+    
+    def _reward_low_torques(self):
+        torque_sq_sum = torch.sum(torch.square(self.torques), dim=1)
+        # 更敏感的衰减（TAU_TARGET 应接近正常值）
+        TAU_TARGET = 200.0  # 如果单关节 max=30，12关节满载≈12*900=10800 → 但倒立时应<1000
+        return torch.exp(-torque_sq_sum / TAU_TARGET)
