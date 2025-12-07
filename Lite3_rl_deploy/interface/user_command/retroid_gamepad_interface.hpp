@@ -65,6 +65,9 @@ public:
 
 
 void RetroidGamepadInterface::TransformRetroidToUserCommand(){
+    // ===== 新增：模式切换状态 =====
+    static bool mode_toggle_state_ = false;  // false=站立, true=手倒立
+
     while (transform_cmd_flag_) {
         rt_keys_ = gamepad_ptr_->GetKeys();
         // PrintGamepadData(&rt_keys_);
@@ -73,32 +76,54 @@ void RetroidGamepadInterface::TransformRetroidToUserCommand(){
             first_flag_ = false;
             continue;
         }
+
+        // 更新速度命令（始终有效）
         usr_cmd_.forward_vel_scale = rt_keys_.left_axis_y;
         usr_cmd_.side_vel_scale = -rt_keys_.left_axis_x;
         usr_cmd_.turnning_vel_scale = -rt_keys_.right_axis_x;
+
+        // 检测按键变化（只在状态改变时触发）
         if (!IsKeysEqual(rt_keys_, rt_keys_record_)) {
-            switch (msfb_.current_state){
-            case RobotMotionState::WaitingForStand:
-                if(rt_keys_.Y != rt_keys_record_.Y) {
-                    usr_cmd_.target_mode = int(RobotMotionState::StandingUp); 
-                }
-                break;
-            case RobotMotionState::StandingUp:
-                if(rt_keys_.A != rt_keys_record_.A){
-                    usr_cmd_.target_mode = int(RobotMotionState::RLControlMode);
-                }
-                break;
-            
-            default:
-                break;
-            }
-            if(bool(rt_keys_.left_axis_button)&&bool(rt_keys_.right_axis_button)){
-                usr_cmd_.target_mode = int(RobotMotionState::JointDamping);
+            switch (msfb_.current_state) {
+                case RobotMotionState::WaitingForStand:
+                    if (rt_keys_.Y && !rt_keys_record_.Y) {  // Y键按下
+                        usr_cmd_.target_mode = int(RobotMotionState::StandingUp); 
+                    }
+                    break;
+
+                case RobotMotionState::StandingUp:
+                    if (rt_keys_.A && !rt_keys_record_.A) {  // A键按下
+                        usr_cmd_.target_mode = int(RobotMotionState::RLControlMode);
+                    }
+                    break;
+
+                case RobotMotionState::RLControlMode:
+                    // ========== 新增：手柄 X 键切换站立/手倒立模式 ==========
+                    if (rt_keys_.X && !rt_keys_record_.X) {
+                        // 切换模式状态
+                        mode_toggle_state_ = !mode_toggle_state_;
+                        
+                        // 设置 mode_command: 0=站立, 1=手倒立
+                        usr_cmd_.mode_command = mode_toggle_state_ ? 1.0f : 0.0f;
+                        
+                        // 调试输出（可选）
+                        std::cout << "[手柄] 模式切换: " 
+                                  << (mode_toggle_state_ ? "手倒立模式" : "站立模式")
+                                  << " (命令值: " << usr_cmd_.mode_command << ")" << std::endl;
+                    }
+                    // ==============================================
+
+                    // 紧急停止：双摇杆按下
+                    if (bool(rt_keys_.left_axis_button) && bool(rt_keys_.right_axis_button)) {
+                        usr_cmd_.target_mode = int(RobotMotionState::JointDamping);
+                    }
+                    break;
+
+                default:
+                    break;
             }
             rt_keys_record_ = rt_keys_;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 }
-
-

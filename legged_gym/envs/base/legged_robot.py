@@ -2367,12 +2367,12 @@ class LeggedRobot(BaseTask):
 
         # 3. 关节接近默认姿态
         joint_error = torch.mean((self.dof_pos - self.default_dof_pos)**2, dim=1)
-        posture_reward = torch.exp(-joint_error / 0.01)
+        posture_reward = torch.exp(-joint_error / 0.05)
 
         total_reward = (
             orientation_reward * 0.35 +
-            contact_reward * 0.3 +
-            posture_reward * 0.35
+            contact_reward * 0.25 +
+            posture_reward * 0.4
         )
 
         # ✅ 只在 standing 模式下生效！

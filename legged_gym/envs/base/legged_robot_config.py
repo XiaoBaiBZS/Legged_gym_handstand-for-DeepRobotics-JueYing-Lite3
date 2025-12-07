@@ -1,33 +1,3 @@
-# SPDX-FileCopyrightText: Copyright (c) 2021 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: BSD-3-Clause
-# 
-# Redistribution and use in source and binary forms, with or without
-# modification, are permitted provided that the following conditions are met:
-#
-# 1. Redistributions of source code must retain the above copyright notice, this
-# list of conditions and the following disclaimer.
-#
-# 2. Redistributions in binary form must reproduce the above copyright notice,
-# this list of conditions and the following disclaimer in the documentation
-# and/or other materials provided with the distribution.
-#
-# 3. Neither the name of the copyright holder nor the names of its
-# contributors may be used to endorse or promote products derived from
-# this software without specific prior written permission.
-#
-# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
-# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
-# DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
-# FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
-# DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
-# SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
-# CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
-# OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-#
-# Copyright (c) 2021 ETH Zurich, Nikita Rudin
-
 from .base_config import BaseConfig
 
 
@@ -145,18 +115,18 @@ class LeggedRobotCfg(BaseConfig):
     class rewards:
         class scales:
             # ===== 惩罚项（务必小！）=====
-            termination = -10.0          # 正确
+            termination = -25.0          # 正确
             collision = -2.0             # OK，可保留
-            torques = 0              # ✅ 合理（若 torque²_sum ~1e5，则单步≈-2） e-6
+            torques = 2e-7              # ✅ 合理（若 torque²_sum ~1e5，则单步≈-2） e-6
             dof_acc = 0              # ✅ 很小，安全
-            dof_vel = -0.001
-            dof_pos_limits = -5
-            action_rate = 0       # ✅ 合理（动作差值~0.1，平方和~0.01 → -2e-5）
+            dof_vel = -0.0005
+            dof_pos_limits = -0.4
+            action_rate = -0.0007       # ✅ 合理（动作差值~0.1，平方和~0.01 → -2e-5）
             torque_smoothness = 0   # ⚠️ 可能偏大！建议先降
 
             # ===== 主任务奖励 =====
-            standing = 12.0              # OK
-            handstand = 17.5             # OK
+            standing = 21              # OK
+            handstand = 26.25             # OK
             handstand_feet_air_time = 0.0  # ✅ 注意：这个函数必须返回“空中时间”（正数）
             low_torques = 0.0  # 正权重！鼓励小扭矩
 

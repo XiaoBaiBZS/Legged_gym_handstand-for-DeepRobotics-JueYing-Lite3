@@ -190,7 +190,7 @@ def export_policy_as_onnx(actor_critic):
         else:
             print(f"文件不存在: {path}")
     print("path:",body_onnx_path)
-    torch.onnx.export(model, actor_input, body_onnx_path,input_names=['obs'],output_names=['actions'], opset_version=11)
+    torch.onnx.export(model, actor_input, body_onnx_path,input_names=['obs'],output_names=['action'], opset_version=11)
 
 def export_policy_as_jit(actor_critic, path):
     if hasattr(actor_critic, 'memory_a'):
